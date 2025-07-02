@@ -1,0 +1,12 @@
+[Unit]
+Description=Moonlight Button Handler
+After=network.target
+
+[Service]
+User=tsuki
+ExecStart=/usr/bin/python3 /path/to/galaxy/button-handler.py
+Restart=on-failure
+WorkingDirectory=/path/to/galaxy
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+[Install]
+WantedBy=multi-user.target
