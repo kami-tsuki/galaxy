@@ -259,8 +259,57 @@ BUTTON_GPIO=17                          # GPIO pin for the button (BCM numbering
 LED_GPIO=27                             # GPIO pin for the LED (BCM numbering)
 
 # System Paths
-LOG_FILE=/home/<usr>/galaxy/logs.log    # Path to log file
+LOG_FILE=/home/<usr>/galaxy/logs.log    # Path to main log file
 PID_FILE=/home/<usr>/galaxy/launch-game.pid  # Path to PID file for process tracking
+
+# Advanced Monitoring Configuration (Optional - New in Enhanced Version)
+HEALTH_CHECK_INTERVAL=30                # Health check interval in seconds (default: 30)
+CONNECTION_TIMEOUT=10                   # Network connection timeout in seconds (default: 10)  
+MAX_RESTART_ATTEMPTS=3                  # Maximum automatic restart attempts (default: 3)
+PROCESS_CHECK_INTERVAL=5                # Process monitoring interval in seconds (default: 5)
+```
+
+### Advanced Configuration Options
+
+The enhanced version includes additional monitoring and error handling configuration:
+
+#### Health Monitoring Settings
+```bash
+# How often to perform comprehensive health checks (seconds)
+HEALTH_CHECK_INTERVAL=30
+
+# Timeout for network connectivity tests (seconds)  
+CONNECTION_TIMEOUT=10
+
+# How often to check process state (seconds)
+PROCESS_CHECK_INTERVAL=5
+```
+
+#### Error Recovery Settings  
+```bash
+# Maximum attempts to restart failed streams before entering error state
+MAX_RESTART_ATTEMPTS=3
+
+# These settings help balance responsiveness vs system load
+# Lower values = more responsive but higher CPU usage
+# Higher values = less responsive but lower system impact
+```
+
+#### Performance Tuning
+For different system configurations, you may want to adjust these values:
+
+**High-Performance Systems** (Raspberry Pi 4+):
+```bash
+HEALTH_CHECK_INTERVAL=15    # More frequent monitoring
+PROCESS_CHECK_INTERVAL=3    # Faster process checks  
+CONNECTION_TIMEOUT=5        # Shorter timeouts
+```
+
+**Low-Power Systems** (Raspberry Pi 3B or older):
+```bash
+HEALTH_CHECK_INTERVAL=60    # Less frequent monitoring
+PROCESS_CHECK_INTERVAL=10   # Slower process checks
+CONNECTION_TIMEOUT=15       # Longer timeouts for slower networks
 ```
 
 ### Finding Your Configuration Values
@@ -311,37 +360,165 @@ galaxy/
 
 ### File Explanations
 
-#### `button-handler.py` - Main Service
-The core Python service that handles button presses and LED control.
+#### `button-handler.py` - Enhanced Main Service
+The core Python service that handles button presses and LED control with comprehensive monitoring and error handling.
+
+**Enhanced Features:**
+- **State Management**: Robust state machine with 6 states (IDLE, STARTING, RUNNING, STOPPING, ERROR, UNKNOWN)
+- **Health Monitoring**: Background thread performing regular system health checks
+- **Process Monitoring**: Continuous monitoring of Moonlight process state
+- **Connection Monitoring**: Network connectivity checks to gaming PC
+- **Error Recovery**: Automatic error detection and recovery mechanisms
+- **Advanced Logging**: Multi-level logging with separate error logs and thread information
 
 **Key Functions:**
-- `is_running()`: Checks if Moonlight stream is active via PID file
-- `on_button_press()`: Main event handler for button presses
-- **LED Patterns**:
-  - Slow blink (0.5s): Starting stream
-  - Fast blink (0.1s): Stopping stream
-  - Solid off: Idle state
+- `_health_monitor()`: Background health monitoring with PID file validation
+- `_process_monitor()`: Continuous process state verification
+- `_is_process_running()`: Enhanced process detection with psutil integration
+- `_perform_preflight_checks()`: Pre-start validation checks
+- `_handle_start_failure()`: Intelligent retry logic with backoff
+- `_force_cleanup()`: Emergency cleanup for stuck processes
+
+**LED Status Indicators:**
+- **Solid Off**: System idle
+- **Slow Blink** (0.5s): Starting stream sequence
+- **Solid On**: Stream running successfully  
+- **Fast Blink** (0.1s): Stopping stream
+- **Very Fast Blink** (0.05s): Error state - check logs
+
+**Enhanced Error Handling:**
+- **GPIO Protection**: Comprehensive GPIO initialization with error recovery
+- **Process Validation**: Continuous verification that PID file matches actual running process
+- **Network Monitoring**: Regular connectivity checks to gaming PC
+- **Resource Monitoring**: System resource usage tracking (CPU, RAM, disk)
+- **Timeout Protection**: All operations have configurable timeouts
+- **Automatic Cleanup**: Orphaned process detection and cleanup
+
+**Monitoring Features:**
+- **Health Checks**: Regular validation of system state every 30 seconds (configurable)
+- **Process Tracking**: Real-time process state monitoring every 5 seconds (configurable)
+- **Connection Testing**: Network connectivity verification to gaming PC
+- **State Validation**: Automatic correction of state mismatches
+- **Debouncing**: Smart button press filtering to prevent accidental triggers
 
 **Dependencies:**
-- `gpiozero`: Hardware GPIO control
+- `psutil`: Advanced process and system monitoring
+- `gpiozero`: Hardware GPIO control with enhanced error handling
 - `python-dotenv`: Environment variable loading
-- `subprocess`: External command execution
-- `logging`: Custom formatted logging
+- `threading`: Background monitoring threads
+- `socket`: Network connectivity testing
+- `signal`: Graceful shutdown handling
 
-#### `launch-game.sh` - Streaming Controller
-Bash script that orchestrates the streaming workflow.
+**Configuration Options** (via .env):
+```bash
+HEALTH_CHECK_INTERVAL=30        # Health check frequency (seconds)
+CONNECTION_TIMEOUT=10           # Network timeout (seconds) 
+MAX_RESTART_ATTEMPTS=3          # Maximum retry attempts
+PROCESS_CHECK_INTERVAL=5        # Process monitoring frequency (seconds)
+```
 
-**Start Sequence:**
-1. Powers on TV via CEC command
-2. Sends Wake-on-LAN packet to PC
-3. Waits 30 seconds for PC boot
-4. Launches Moonlight with specified app
-5. Saves process PID for tracking
+#### `launch-game.sh` - Enhanced Streaming Controller
+Advanced bash script that orchestrates the complete streaming workflow with comprehensive error handling, monitoring, and validation.
 
-**Stop Sequence:**
-1. Kills Moonlight process
-2. Powers off TV via CEC
-3. Cleans up PID file
+**Enhanced Features v2.0.0:**
+- **Comprehensive Error Handling**: Full error recovery with detailed logging and rollback capabilities
+- **Network Connectivity Testing**: Smart connectivity checks before and during operations
+- **Advanced Process Management**: Graceful process termination with fallback to force-kill
+- **Intelligent Boot Detection**: Dynamic PC boot detection instead of fixed wait times  
+- **Retry Logic**: Configurable retry mechanisms for all network operations
+- **Dependency Validation**: Automatic checking of all required system dependencies
+- **Signal Handling**: Proper cleanup on script interruption or termination
+- **Status Monitoring**: Comprehensive status checking and process validation
+
+**Enhanced Start Sequence:**
+1. **Pre-flight Checks**: Validates dependencies and environment configuration
+2. **Process Cleanup**: Safely terminates any existing streaming processes
+3. **TV Power Control**: Powers on TV via CEC with timeout and error handling
+4. **Network Testing**: Tests initial PC connectivity before Wake-on-LAN
+5. **Smart Wake-on-LAN**: Multiple retry attempts with packet validation
+6. **Intelligent Boot Wait**: Dynamic connectivity testing during boot wait
+7. **Stream Launch**: Enhanced Moonlight launch with comprehensive error capture
+8. **Process Validation**: Confirms successful stream establishment
+
+**Enhanced Stop Sequence:**
+1. **Graceful Termination**: SIGTERM followed by SIGKILL if needed
+2. **Orphan Cleanup**: Finds and terminates any orphaned Moonlight processes
+3. **TV Power Off**: CEC standby command with error handling
+4. **Resource Cleanup**: Removes temporary files and runtime directories
+5. **Status Validation**: Confirms complete shutdown
+
+**New Command Options:**
+```bash
+# Basic usage
+./launch-game.sh start          # Start streaming
+./launch-game.sh stop           # Stop streaming  
+./launch-game.sh status         # Check current status
+
+# Advanced usage with options
+./launch-game.sh start --verbose    # Verbose output
+./launch-game.sh start --debug      # Debug mode with detailed logging
+./launch-game.sh start --dry-run    # Show what would be done
+./launch-game.sh help               # Show detailed help
+```
+
+**Enhanced Error Detection:**
+- **MAC Address Validation**: Regex validation of MAC address format
+- **IP Address Validation**: Format checking for gaming PC IP
+- **Dependency Checking**: Verification of all required commands (cec-client, wakeonlan, moonlight, ping, nc)
+- **Process State Monitoring**: Continuous validation of process health
+- **Network Connectivity**: Multi-layer connectivity testing (ping + port checks)
+- **Resource Availability**: Checks for required files and permissions
+
+**Smart Network Operations:**
+- **Pre-Wake Testing**: Checks if PC is already awake before Wake-on-LAN
+- **Connectivity Retries**: Configurable retry logic for network operations
+- **Port-Specific Testing**: Tests Sunshine port (47989) availability
+- **Timeout Management**: All network operations have configurable timeouts
+- **Connection Validation**: Multi-step verification of PC readiness
+
+**Advanced Logging Features:**
+- **Millisecond Timestamps**: High-precision timing for debugging
+- **Thread IDs**: Process identification for multi-process debugging
+- **Multiple Log Levels**: DEBUG, INFO, WARN, ERROR with appropriate routing
+- **Structured Output**: Consistent formatting for log parsing
+- **Error Capture**: Comprehensive error output capture and logging
+
+**Configuration Options** (via .env):
+```bash
+# Timing Configuration
+BOOT_WAIT_TIME=30               # Maximum PC boot wait (seconds)
+CONNECTION_TIMEOUT=10           # Network operation timeout
+PROCESS_WAIT_TIMEOUT=60         # Process startup wait timeout
+
+# Retry Configuration  
+MAX_RETRIES=3                   # Maximum retry attempts
+RETRY_DELAY=5                   # Delay between retries
+WOL_RETRIES=2                   # Wake-on-LAN retry attempts
+
+# Hardware Configuration
+CEC_TIMEOUT=5                   # CEC command timeout
+
+# Advanced Options
+MOONLIGHT_EXTRA_ARGS=""         # Additional Moonlight arguments
+DEBUG=false                     # Enable debug output
+VERBOSE=false                   # Enable verbose output
+```
+
+**Performance Optimizations:**
+- **Early PC Detection**: Skips Wake-on-LAN if PC already responsive
+- **Parallel Operations**: Network tests run concurrently where possible
+- **Smart Timeouts**: Adaptive timeouts based on network conditions
+- **Resource Cleanup**: Automatic cleanup of temporary resources
+- **Process Monitoring**: Efficient process state checking
+
+**Dependencies:**
+- `cec-client`: TV control via HDMI-CEC
+- `wakeonlan`: Wake-on-LAN packet transmission
+- `moonlight`: Game streaming client
+- `ping`: Network connectivity testing  
+- `nc` (netcat): Port-specific connectivity testing
+- `ps`, `kill`: Process management
+- `timeout`: Command timeout handling
 
 #### `setup.sh` - Installation Automation
 Automated setup script that:
@@ -503,17 +680,60 @@ Add custom TV commands in `launch-game.sh`:
 ### Real-Time Monitoring
 
 #### Application Logs
-Monitor Galaxy's detailed logs:
+Monitor Galaxy's detailed logs with enhanced error tracking:
 ```bash
-# View recent logs
+# View recent logs (main log with all events)
 tail -n 50 /home/<usr>/galaxy/logs.log
 
 # Follow logs in real-time
 tail -f /home/<usr>/galaxy/logs.log
 
+# View error-only log (new feature)
+tail -f /home/<usr>/galaxy/logs_errors.log
+
 # Search for specific events
 grep "ERROR" /home/<usr>/galaxy/logs.log
 grep "Button pressed" /home/<usr>/galaxy/logs.log
+grep "State changed" /home/<usr>/galaxy/logs.log
+grep "Health check" /home/<usr>/galaxy/logs.log
+
+# Monitor process state changes
+grep "Process.*is.*healthy\|Process.*no longer exists\|PID file" /home/<usr>/galaxy/logs.log
+
+# Check network connectivity issues  
+grep "Network connectivity\|Cannot connect\|Cannot reach" /home/<usr>/galaxy/logs.log
+```
+
+#### Enhanced Log Analysis
+The new logging system provides detailed information with timestamps, thread names, and context:
+
+**Log Format:**
+```
+[DD.MM.YYYY HH:MM:SS.fff] [LEVEL] [ThreadName] [ButtonHandler] Message
+```
+
+**Log Levels:**
+- **DEBUG**: Detailed diagnostic information
+- **INFO**: General operational messages
+- **WARNING**: Important issues that don't stop operation  
+- **ERROR**: Serious problems requiring attention
+
+**Key Log Patterns to Monitor:**
+```bash
+# System health monitoring
+grep "Health check\|Resource usage\|State mismatch" logs.log
+
+# Process management
+grep "Process.*healthy\|PID file.*cleaned\|Force cleanup" logs.log
+
+# Network issues
+grep "connectivity\|Cannot reach\|timeout" logs.log
+
+# Hardware problems
+grep "GPIO\|LED.*failed\|Button" logs.log
+
+# State transitions
+grep "State changed.*→" logs.log
 ```
 
 #### Service Logs
@@ -613,7 +833,111 @@ wakeonlan xx:yy:xx:yy:xx:yy
    arp -a | grep YOUR_PC_IP
    ```
 
-#### 🎮 Moonlight Not Starting
+#### 🚀 Enhanced Launch Script Issues
+
+**New Diagnostic Commands:**
+```bash
+# Check script status and detailed diagnostics
+./launch-game.sh status --verbose
+
+# Test script with debug output (doesn't actually run)
+./launch-game.sh start --dry-run --debug
+
+# Manual dependency check
+./launch-game.sh help  # Shows all dependencies
+
+# Test individual components
+ping -c 1 192.168.x.y                    # Test PC connectivity
+nc -z -w 5 192.168.x.y 47989             # Test Sunshine port
+echo "scan" | cec-client -s -d 1          # Test CEC connectivity
+wakeonlan xx:yy:xx:yy:xx:yy               # Test Wake-on-LAN
+```
+
+**Enhanced Error Messages:**
+The enhanced script provides much more detailed error information:
+
+```bash
+# Environment validation errors:
+[timestamp] [ERROR] [LaunchGame] Missing required environment variables: PC_MAC, MOONLIGHT_HOST
+[timestamp] [ERROR] [LaunchGame] Invalid MAC address format: xx:yy:zz:aa:bb:cc
+
+# Dependency errors:
+[timestamp] [ERROR] [LaunchGame] Missing required dependencies: netcat-openbsd, cec-utils
+
+# Network connectivity errors:
+[timestamp] [ERROR] [LaunchGame] PC is not responding after boot sequence
+[timestamp] [ERROR] [LaunchGame] Network connectivity test failed after 3 attempts
+
+# Process management errors:
+[timestamp] [ERROR] [LaunchGame] Moonlight process failed to start or exited immediately
+[timestamp] [ERROR] [LaunchGame] Process 1234 died during startup (after 15s)
+```
+
+**Smart Troubleshooting Features:**
+1. **Automatic Diagnostics**: Script automatically identifies common issues
+2. **Detailed Error Context**: Each error includes specific remediation steps
+3. **Component Testing**: Individual component validation before operations
+4. **Network Path Analysis**: Multi-layer network connectivity testing
+5. **Process Health Monitoring**: Continuous validation of process state
+
+**Common Issues & Enhanced Solutions:**
+
+**Script Fails with "Missing dependencies":**
+```bash
+# The script now automatically checks for:
+# - cec-client, wakeonlan, moonlight, ping, nc
+# Install missing dependencies:
+sudo apt install cec-utils wakeonlan netcat-openbsd iputils-ping
+
+# Check what's missing:
+./launch-game.sh start --debug  # Will show specific missing commands
+```
+
+**"PC is not responding after boot sequence":**
+```bash
+# Enhanced diagnostics will show:
+# - Whether Wake-on-LAN packets were sent successfully
+# - Network connectivity test results
+# - Specific timeout values and retry attempts
+
+# Check detailed network path:
+./launch-game.sh status --verbose  # Shows current PC connectivity
+ping -c 5 192.168.x.y              # Manual connectivity test
+nc -z -w 10 192.168.x.y 47989      # Test Sunshine specifically
+```
+
+**"Moonlight process failed to start":**
+```bash
+# Enhanced error capture shows exact Moonlight error:
+grep "Moonlight error output" /path/to/logs.log
+
+# Common Moonlight issues the script now detects:
+# - App name not found in Sunshine
+# - Network connectivity lost during launch
+# - Authentication/pairing issues
+# - Resource conflicts
+
+# Test Moonlight manually:
+moonlight list 192.168.x.y                    # List available apps
+moonlight stream -app "Steam Big Picture" 192.168.x.y  # Manual test
+```
+
+**Performance Tuning for Enhanced Script:**
+```bash
+# For faster systems (reduce timeouts):
+BOOT_WAIT_TIME=20               # Reduce boot wait
+CONNECTION_TIMEOUT=5            # Faster network timeouts
+PROCESS_WAIT_TIMEOUT=30         # Reduce process wait
+
+# For slower systems (increase timeouts):  
+BOOT_WAIT_TIME=60               # Longer boot wait
+CONNECTION_TIMEOUT=15           # More patient network timeouts
+MAX_RETRIES=5                   # More retry attempts
+
+# For debugging (enable verbose logging):
+DEBUG=true                      # Show all debug information
+VERBOSE=true                    # Enable console output
+```
 **Symptoms:** PC wakes up but stream doesn't start
 
 **Diagnosis:**
@@ -640,7 +964,93 @@ moonlight stream -app "Steam Big Picture" 192.168.x.y
    moonlight pair 192.168.x.y
    ```
 
-#### 🔄 Service Keeps Restarting
+#### 🔄 Enhanced Error States & Recovery
+
+**Symptoms:** LED blinking very fast (0.05s) - Error state
+
+**New Error Detection Features:**
+The enhanced button handler now detects and handles many error conditions automatically:
+
+1. **Stale PID Files**: Automatically detects and cleans up PID files pointing to non-existent processes
+2. **Process State Mismatches**: Corrects situations where internal state doesn't match actual process state  
+3. **Stuck State Detection**: Identifies when system is stuck in STARTING/STOPPING states too long
+4. **Orphaned Processes**: Finds and cleans up abandoned Moonlight processes
+5. **Network Connectivity Issues**: Monitors connection to gaming PC and warns of issues
+
+**Automatic Recovery Actions:**
+```bash
+# The system now automatically:
+# - Cleans stale PID files
+# - Kills orphaned processes  
+# - Resets state mismatches
+# - Provides detailed error logging
+# - Attempts intelligent retries
+```
+
+**Manual Recovery Steps:**
+```bash
+# If system enters error state, check error log:
+tail -n 20 /home/<usr>/galaxy/logs_errors.log
+
+# Check system resource usage:
+grep "High.*usage\|Resource usage" /home/<usr>/galaxy/logs.log
+
+# Force reset the system:
+sudo systemctl restart moonlight-button.service
+
+# Check for hardware issues:
+python3 test-button-led.py
+```
+
+**Advanced Diagnostics:**
+```bash
+# Check process monitoring thread health:
+grep "ProcessMonitor\|HealthMonitor" /home/<usr>/galaxy/logs.log
+
+# Verify state transitions are working:
+grep "State changed.*→" /home/<usr>/galaxy/logs.log | tail -10
+
+# Check network connectivity monitoring:
+grep "Network connectivity.*OK\|Cannot reach" /home/<usr>/galaxy/logs.log
+
+# Monitor automatic cleanup actions:
+grep "cleaned up\|Force cleanup\|Killing orphaned" /home/<usr>/galaxy/logs.log
+```
+
+#### 📊 System Health Monitoring  
+
+**Real-time Health Checks:**
+The system now performs comprehensive health monitoring every 30 seconds:
+
+```bash
+# Monitor health check results:
+grep "Health check\|Resource usage" /home/<usr>/galaxy/logs.log | tail -10
+
+# Check for resource warnings:
+grep "High.*usage" /home/<usr>/galaxy/logs.log
+
+# Verify process monitoring:
+grep "Process.*is.*healthy" /home/<usr>/galaxy/logs.log | tail -5
+```
+
+**Health Check Components:**
+- **PID File Validation**: Ensures PID file points to actual Moonlight process
+- **Process State Verification**: Confirms process is running and responding
+- **Network Connectivity**: Tests connection to gaming PC
+- **System Resources**: Monitors CPU, RAM, and disk usage
+- **State Consistency**: Validates internal state matches reality
+
+**Interpreting Health Warnings:**
+```bash
+# High resource usage warnings:
+[timestamp] [WARNING] [HealthMonitor] [ButtonHandler] High memory usage: 92.1%
+
+# Network connectivity issues:
+[timestamp] [WARNING] [HealthMonitor] [ButtonHandler] Cannot connect to 192.168.x.x:47989
+
+# Process state problems:
+[timestamp] [WARNING] [HealthMonitor] [ButtonHandler] Process 1234 is zombie
+```
 **Symptoms:** Service shows "failed" or constantly restarting
 
 **Diagnosis:**
