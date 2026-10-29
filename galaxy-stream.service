@@ -14,8 +14,9 @@ TTYVHangup=yes
 UtmpIdentifier=tty1
 UtmpMode=user
 EnvironmentFile=/etc/galaxy/galaxy.env
-Environment=XDG_RUNTIME_DIR=/run/user/%U
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
-ExecStart=/usr/bin/setpriv --inh-caps=-all /usr/bin/cage -s -- /usr/bin/flatpak run --env=SDL_AUDIODRIVER=alsa --env=AUDIODEV=${AUDIO_DEVICE} com.moonlight_stream.Moonlight stream ${PC_HOST} ${SUNSHINE_APP} $MOONLIGHT_ARGS
+EnvironmentFile=-/run/user/@UID@/galaxy-session.env
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+ExecStart=/usr/bin/setpriv --inh-caps=-all /usr/bin/cage -s -- /usr/bin/flatpak run --env=SDL_AUDIODRIVER=${AUDIO_DRIVER} --env=AUDIODEV=${AUDIO_DEVICE} com.moonlight_stream.Moonlight stream ${PC_HOST} ${SUNSHINE_APP} $MOONLIGHT_ARGS $RESOLUTION_FLAGS $AUDIO_FLAGS
 ExecStopPost=+/usr/bin/systemctl --no-block start getty@tty1.service
 Restart=no

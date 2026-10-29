@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Galaxy</title>
+<style>
+:root {
+  --bg: #f4f5fb;
+  --card: #ffffff;
+  --ink: #161833;
+  --muted: #6a6e8e;
+  --line: #d9dbed;
+  --accent: #4b5cff;
+  --accent-ink: #ffffff;
+  --ok: #1f9d63;
+  --bad: #d6405a;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1020;
+    --card: #181b34;
+    --ink: #eceefb;
+    --muted: #9296b8;
+    --line: #2c3060;
+    --accent: #6573ff;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); min-height: 100vh; display: grid; place-items: start center; padding: 24px 16px; }
+main { width: min(100%, 640px); display: grid; gap: 20px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+h1 { margin: 0; font-size: 1.5rem; letter-spacing: 0.02em; }
+h2 { margin: 0 0 10px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; }
+.pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); font-size: 0.85rem; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.dot.on { background: var(--ok); }
+.dot.err { background: var(--bad); }
+.dot.busy { background: var(--accent); animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: 0.35; } }
+.choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.choice { text-align: left; padding: 14px; border-radius: 14px; border: 2px solid var(--line); background: var(--card); color: var(--ink); font: inherit; cursor: pointer; display: grid; gap: 4px; }
+.choice strong { font-size: 1rem; }
+.choice span { font-size: 0.8rem; color: var(--muted); }
+.choice[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+.choice:disabled { opacity: 0.55; cursor: not-allowed; }
+.go { width: 100%; padding: 18px; border: 0; border-radius: 16px; background: var(--accent); color: var(--accent-ink); font: inherit; font-size: 1.15rem; font-weight: 600; cursor: pointer; }
+.go.stop { background: var(--bad); }
+.go:disabled { opacity: 0.6; cursor: wait; }
+.msg { min-height: 1.4em; color: var(--muted); font-size: 0.9rem; text-align: center; }
+.msg.err { color: var(--bad); }
+details { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
+summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
+.tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.tools button, .tools input { font: inherit; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+.tools input { flex: 1 1 200px; }
+button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Galaxy</h1>
+    <div class="pill"><span class="dot" id="dot"></span><span id="state">connecting</span></div>
+  </header>
+
+  <section>
+    <h2>Screen to share</h2>
+    <div class="choices" id="displays"></div>
+  </section>
+
+  <section>
+    <h2>What to show</h2>
+    <div class="choices" id="apps"></div>
+  </section>
+
+  <section>
+    <h2>Sound</h2>
+    <div class="choices" id="audio"></div>
+  </section>
+
+  <button class="go" id="go" type="button" disabled>Connect</button>
+  <div class="msg" id="msg" role="status" aria-live="polite"></div>
+
+  <details>
+    <summary>More</summary>
+    <div class="tools">
+      <button type="button" data-post="wake">Wake PC</button>
+      <button type="button" data-post="tv/on">TV on</button>
+      <button type="button" data-post="tv/off">TV off</button>
+      <button type="button" data-post="sleep">Sleep PC</button>
+      <input id="token" type="password" placeholder="API token" autocomplete="off">
+    </div>
+  </details>
+</main>
+
+<script>
+const LABELS = {
+  main: ["Main screen", "Wide monitor, shown with bars on the TV"],
+  tv: ["TV screen", "Second monitor, full HD"],
+  obs: ["OBS output", "What OBS is sending"],
+  both: ["PC + TV", "Sound on both"],
+  pc: ["PC only", "TV stays quiet"],
+  tv_audio: ["TV only", "PC stays quiet"]
+};
+const PHASES = {
+  idle: "Ready", tv: "Turning the TV on", waking: "Waking the PC", display: "Switching screen",
+  connecting: "Connecting", streaming: "Connected", stopping: "Disconnecting", error: "Problem"
+};
+
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(key, fallback) { try { return localStorage.getItem(key) || fallback; } catch (e) { return fallback; } },
+  set(key, value) { try { localStorage.setItem(key, value); } catch (e) {} }
+};
+
+const hash = new URLSearchParams(location.hash.slice(1));
+if (hash.get("token")) {
+  store.set("token", hash.get("token"));
+  history.replaceState(null, "", location.pathname);
+}
+$("token").value = store.get("token", "");
+$("token").addEventListener("change", () => { store.set("token", $("token").value); poll(); });
+
+const choice = { display: store.get("display", ""), app: store.get("app", ""), audio: store.get("audio", "both") };
+let current = null;
+let pending = false;
+let dirty = false;
+let notice = "";
+
+function headers() { return { Authorization: "Bearer " + $("token").value, "Content-Type": "application/json" }; }
+
+async function api(path, method, body) {
+  const response = await fetch("/v1/" + path, { method: method || "GET", headers: headers(), body: body ? JSON.stringify(body) : undefined });
+  if (response.status === 401) throw new Error("Token missing or wrong, open More and enter it");
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Request failed");
+  return data;
+}
+
+function render(group, items, key, labelOf, locked) {
+  const box = $(group);
+  box.replaceChildren();
+  for (const item of items) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "choice";
+    button.setAttribute("aria-pressed", String(choice[key] === item));
+    button.disabled = locked;
+    const [title, hint] = labelOf(item);
+    const strong = document.createElement("strong");
+    strong.textContent = title;
+    const span = document.createElement("span");
+    span.textContent = hint;
+    button.append(strong, span);
+    button.addEventListener("click", () => { choice[key] = item; store.set(key, item); dirty = true; draw(); });
+    box.append(button);
+  }
+}
+
+function audioLabel(mode) { return LABELS[mode === "tv" ? "tv_audio" : mode]; }
+
+function draw() {
+  if (!current) return;
+  const streaming = current.stream;
+  const locked = pending || current.busy;
+  if (!current.displays.includes(choice.display)) choice.display = current.displays.includes("tv") ? "tv" : current.displays[0] || "";
+  if (!current.apps.includes(choice.app)) choice.app = current.apps[0] || "";
+  render("displays", current.displays, "display", (n) => LABELS[n] || [n, ""], locked);
+  render("apps", current.apps, "app", (n) => [n, ""], locked);
+  render("audio", current.audio_modes, "audio", audioLabel, locked);
+
+  const phase = current.phase;
+  $("state").textContent = PHASES[phase] || phase;
+  $("dot").className = "dot " + (phase === "error" ? "err" : streaming ? "on" : locked ? "busy" : "");
+  $("go").textContent = locked ? PHASES[phase] || "Working" : streaming ? (dirty ? "Apply changes" : "Disconnect") : "Connect";
+  $("go").className = "go" + (streaming && !locked && !dirty ? " stop" : "");
+  $("go").disabled = locked;
+  const message = $("msg");
+  const problem = notice || current.error;
+  message.className = "msg" + (problem ? " err" : "");
+  message.textContent = problem || current.warning || (!current.pc_online && !streaming && phase === "idle" ? "PC is off or asleep, Connect will wake it" : "");
+}
+
+async function poll() {
+  try {
+    current = await api("status");
+    if (current.stream && !dirty && !pending) {
+      if (current.displays.includes(current.display)) choice.display = current.display;
+      if (current.apps.includes(current.app)) choice.app = current.app;
+      if (current.audio_modes.includes(current.audio)) choice.audio = current.audio;
+    }
+    if (!current.stream) dirty = false;
+    draw();
+  } catch (error) {
+    $("state").textContent = "offline";
+    $("dot").className = "dot err";
+    $("msg").className = "msg err";
+    $("msg").textContent = error.message;
+    $("go").disabled = true;
+  }
+}
+
+$("go").addEventListener("click", async () => {
+  pending = true;
+  notice = "";
+  draw();
+  try {
+    if (current.stream && !dirty) await api("stop", "POST");
+    else await api("connect", "POST", { display: choice.display, app: choice.app, audio: choice.audio });
+    dirty = false;
+  } catch (error) {
+    notice = error.message;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  pending = false;
+  poll();
+});
+
+document.querySelectorAll("[data-post]").forEach((button) => button.addEventListener("click", async () => {
+  if (button.dataset.post === "sleep" && !confirm("Put the PC to sleep?")) return;
+  notice = "";
+  try { await api(button.dataset.post, "POST"); } catch (error) { notice = error.message; }
+  poll();
+}));
+
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

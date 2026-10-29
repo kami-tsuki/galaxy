@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import getpass
 import hashlib
 import hmac
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
-ENV_FILES = (Path("/etc/galaxy/galaxy.env"), ROOT / ".env")
+ENV_FILE = Path("/etc/galaxy/galaxy.env")
+ENV_FILES = (ENV_FILE, ROOT / ".env")
 STREAM_UNIT = "galaxy-stream.service"
 DEFAULTS = {
     "PC_HOST": "",
@@ -24,11 +29,13 @@ DEFAULTS = {
     "PC_BROADCAST": "255.255.255.255",
     "PC_SSH": "",
     "SUNSHINE_APP": "Desktop",
+    "APPS": "Desktop,Steam Big Picture",
     "SUNSHINE_PORT": "47989",
     "SUNSHINE_UI_PORT": "47990",
     "SUNSHINE_USER": "",
     "SUNSHINE_PASS": "",
     "DISPLAYS": "",
+    "DISPLAY_RES": "main=3840x1080,tv=1920x1080,obs=1920x1080",
     "OBS_PORT": "4455",
     "OBS_PASS": "",
     "OBS_MONITOR": "1",
@@ -40,16 +47,29 @@ DEFAULTS = {
     "API_PORT": "8787",
     "API_TOKEN": "",
 }
+SECRET_KEYS = ("SUNSHINE_USER", "SUNSHINE_PASS", "OBS_PASS", "API_TOKEN")
 PC_COMMANDS = {
     "sleep": "rundll32.exe powrprof.dll,SetSuspendState 0,1,0",
     "shutdown": "shutdown /s /t 0",
     "restart": "shutdown /r /t 0",
-    "lock": "rundll32.exe user32.dll,LockWorkStation",
 }
+AUDIO_MODES = {
+    "both": ("--audio-on-host", "alsa"),
+    "tv": ("--no-audio-on-host", "alsa"),
+    "pc": ("--audio-on-host", "dummy"),
+}
+MAX_BODY = 4096
+RESOLUTION = re.compile(r"^\d{3,5}x\d{3,5}$")
+MAC = re.compile(r"^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$")
 
-state = {"phase": "idle", "error": "", "since": time.time()}
+state = {"phase": "idle", "error": "", "warning": "", "display": "", "since": time.time()}
 state_lock = threading.Lock()
 job_lock = threading.Lock()
+cache = {}
+
+
+class Busy(RuntimeError):
+    pass
 
 
 def load_config():
@@ -73,16 +93,67 @@ def flag(cfg, key):
     return cfg[key].lower() in ("1", "true", "yes", "on")
 
 
-def set_phase(phase, error=""):
+def pairs(text):
+    result = {}
+    for item in text.split(","):
+        if "=" in item:
+            name, value = item.split("=", 1)
+            result[name.strip()] = value.strip()
+    return result
+
+
+def set_state(**values):
     with state_lock:
-        state.update(phase=phase, error=error, since=time.time())
+        state.update(values, since=time.time())
+
+
+def set_phase(phase, error=""):
+    set_state(phase=phase, error=error)
 
 
 def log(message):
     print(time.strftime("%H:%M:%S"), message, flush=True)
 
 
+def cached(key, ttl, producer):
+    now = time.time()
+    entry = cache.get(key)
+    if entry and now - entry[0] < ttl:
+        return entry[1]
+    value = producer()
+    cache[key] = (now, value)
+    return value
+
+
+def exclusive(function, *args):
+    if not job_lock.acquire(blocking=False):
+        raise Busy("another action is running")
+    try:
+        return function(*args)
+    finally:
+        job_lock.release()
+
+
+def submit(function, *args, report=True):
+    if not job_lock.acquire(blocking=False):
+        raise Busy("another action is running")
+
+    def target():
+        try:
+            function(*args)
+        except Exception as error:
+            log(f"{function.__name__} failed: {error}")
+            if report:
+                set_phase("error", str(error))
+        finally:
+            job_lock.release()
+
+    threading.Thread(target=target, daemon=True).start()
+
+
 def sunshine_up(cfg, timeout=2):
+    if not cfg["PC_HOST"]:
+        return False
     try:
         with socket.create_connection((cfg["PC_HOST"], int(cfg["SUNSHINE_PORT"])), timeout=timeout):
             return True
@@ -91,6 +162,8 @@ def sunshine_up(cfg, timeout=2):
 
 
 def wake(cfg):
+    if not MAC.match(cfg["PC_MAC"]):
+        raise RuntimeError("PC_MAC is not a valid MAC address")
     mac = bytes.fromhex(cfg["PC_MAC"].replace(":", "").replace("-", ""))
     packet = b"\xff" * 6 + mac * 16
     targets = {cfg["PC_BROADCAST"], "255.255.255.255"}
@@ -118,19 +191,24 @@ def cec(cfg, command):
 def tv_power(cfg):
     for line in cec(cfg, "pow 0").splitlines():
         if line.startswith("power status:"):
-            return line.split(":", 1)[1].strip()
+            text = line.split(":", 1)[1].strip()
+            if text == "on" or text.endswith("to on"):
+                return "on"
+            if text == "standby" or text.endswith("to standby"):
+                return "standby"
     return "unknown"
 
 
 def tv(cfg, on):
     if not flag(cfg, "TV_CEC"):
-        return
+        return True
     wanted = "on" if on else "standby"
-    for _ in range(4):
+    for _ in range(3):
         if tv_power(cfg) == wanted:
-            return
+            return True
         cec(cfg, "on 0" if on else "standby 0")
         time.sleep(6)
+    return tv_power(cfg) == wanted
 
 
 def systemctl(action):
@@ -151,19 +229,19 @@ def pc_power(cfg, action):
         text=True,
         timeout=20,
     )
-    if result.returncode not in (0, 255) and result.stderr.strip():
-        raise RuntimeError(result.stderr.strip())
+    if result.returncode == 255:
+        raise RuntimeError(result.stderr.strip() or "PC is not reachable over SSH")
 
 
 def displays(cfg):
-    result = {}
-    for item in cfg["DISPLAYS"].split(","):
-        if "=" in item:
-            name, ident = item.split("=", 1)
-            result[name.strip()] = ident.strip()
+    result = pairs(cfg["DISPLAYS"])
     if cfg["OBS_PASS"] and "tv" in result:
         result["obs"] = result["tv"]
     return result
+
+
+def apps(cfg):
+    return [item.strip() for item in cfg["APPS"].split(",") if item.strip()]
 
 
 class Ws:
@@ -201,9 +279,8 @@ class Ws:
         data, self.buf = self.buf[:count], self.buf[count:]
         return data
 
-    def send(self, message):
-        payload = json.dumps(message).encode()
-        header = bytearray([0x81])
+    def frame(self, opcode, payload):
+        header = bytearray([0x80 | opcode])
         size = len(payload)
         if size < 126:
             header.append(0x80 | size)
@@ -215,6 +292,9 @@ class Ws:
             header += size.to_bytes(8, "big")
         mask = os.urandom(4)
         self.sock.sendall(bytes(header) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def send(self, message):
+        self.frame(1, json.dumps(message).encode())
 
     def recv(self):
         while True:
@@ -228,10 +308,12 @@ class Ws:
             opcode = first & 0x0F
             if opcode == 1:
                 return json.loads(payload)
-            if opcode == 8:
+            if opcode == 9:
+                self.frame(10, payload)
+            elif opcode == 8:
                 code = int.from_bytes(payload[:2], "big") if len(payload) >= 2 else 0
-                reason = {4009: "authentication failed, check OBS_PASS", 4008: "OBS rejected the identify message"}.get(code, f"code {code}")
-                raise RuntimeError(f"OBS closed the connection ({reason})")
+                reasons = {4009: "authentication failed, check OBS_PASS", 4008: "OBS rejected the identify message"}
+                raise RuntimeError(f"OBS closed the connection ({reasons.get(code, f'code {code}')})")
 
 
 def obs_request(cfg, request_type, data=None):
@@ -255,27 +337,59 @@ def obs_request(cfg, request_type, data=None):
                 break
         status = message["d"]["requestStatus"]
         if not status["result"]:
-            raise RuntimeError(status.get("comment", "OBS request failed"))
+            raise RuntimeError(status.get("comment", f"OBS request {request_type} failed"))
         return message["d"].get("responseData", {})
     finally:
         ws.sock.close()
 
 
+def obs_wait(cfg, seconds=30):
+    deadline = time.time() + seconds
+    while True:
+        try:
+            obs_request(cfg, "GetVersion")
+            return
+        except OSError:
+            if time.time() > deadline:
+                raise RuntimeError("OBS is not running or its WebSocket server is off")
+            time.sleep(3)
+
+
 def obs_show(cfg):
-    try:
-        obs_request(cfg, "StartVirtualCam")
-    except RuntimeError as error:
-        log(f"virtual cam: {error}")
-    obs_request(
-        cfg,
-        "OpenVideoMixProjector",
-        {"videoMixType": "OBS_WEBSOCKET_VIDEO_MIX_TYPE_PROGRAM", "monitorIndex": int(cfg["OBS_MONITOR"])},
-    )
+    obs_wait(cfg)
+    with state_lock:
+        camera = state.get("obs_camera", False)
+        projector = state.get("obs_projector", False)
+    if not camera:
+        try:
+            obs_request(cfg, "StartVirtualCam")
+        except RuntimeError as error:
+            log(f"virtual cam: {error}")
+        set_state(obs_camera=True)
+    if not projector:
+        obs_request(
+            cfg,
+            "OpenVideoMixProjector",
+            {"videoMixType": "OBS_WEBSOCKET_VIDEO_MIX_TYPE_PROGRAM", "monitorIndex": int(cfg["OBS_MONITOR"])},
+        )
+        set_state(obs_projector=True)
+
+
+def obs_leave(cfg):
+    with state_lock:
+        camera = state.get("obs_camera", False)
+    set_state(obs_projector=False)
+    if camera:
+        try:
+            obs_request(cfg, "StopVirtualCam")
+        except (OSError, RuntimeError) as error:
+            log(f"virtual cam stop: {error}")
+        set_state(obs_camera=False)
 
 
 def sunshine_api(cfg, method, path, body=None):
     if not cfg["SUNSHINE_USER"]:
-        raise RuntimeError("SUNSHINE_USER is not configured")
+        raise RuntimeError("SUNSHINE_USER is not configured, run: galaxy.py set SUNSHINE_USER")
     context = ssl.create_default_context()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
@@ -286,148 +400,234 @@ def sunshine_api(cfg, method, path, body=None):
         method=method,
         headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, context=context, timeout=15) as response:
-        raw = response.read()
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=15) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"Sunshine answered {error.code}, check SUNSHINE_USER and SUNSHINE_PASS")
     return json.loads(raw) if raw else {}
+
+
+def sunshine_config(cfg):
+    data = sunshine_api(cfg, "GET", "/api/config")
+    return {key: value for key, value in data.items() if key not in ("platform", "version", "status")}
+
+
+def current_output(cfg):
+    def read():
+        try:
+            return sunshine_config(cfg).get("output_name", "")
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    return cached("output", 8, read)
+
+
+def display_name(cfg, online):
+    known = displays(cfg)
+    with state_lock:
+        chosen = state["display"]
+    output = current_output(cfg) if online else None
+    if output is None:
+        return chosen
+    if chosen and known.get(chosen) == output:
+        return chosen
+    for name, ident in known.items():
+        if ident == output and name != "obs":
+            return name
+    return ""
+
+
+def wait_sunshine_restart(cfg):
+    deadline = time.time() + 20
+    while time.time() < deadline and sunshine_up(cfg, 1):
+        time.sleep(1)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if sunshine_up(cfg, 1):
+            try:
+                sunshine_config(cfg)
+                return
+            except (OSError, RuntimeError, ValueError):
+                pass
+        time.sleep(2)
+    raise RuntimeError("Sunshine did not come back after restart")
 
 
 def select_display(cfg, name):
     known = displays(cfg)
     if name not in known:
         raise RuntimeError(f"unknown display '{name}', choose from: {', '.join(known) or 'none configured'}")
+    if not sunshine_up(cfg):
+        raise RuntimeError("PC is not online")
     if stream_active():
         systemctl("stop")
-    sunshine_api(cfg, "POST", "/api/config", {"output_name": known[name]})
-    try:
-        sunshine_api(cfg, "POST", "/api/restart", {})
-    except OSError:
-        pass
-    time.sleep(3)
-    deadline = time.time() + 40
-    while time.time() < deadline and not sunshine_up(cfg):
-        time.sleep(2)
-    if not sunshine_up(cfg):
-        raise RuntimeError("Sunshine did not come back after restart")
+    if sunshine_config(cfg).get("output_name") != known[name]:
+        settings = sunshine_config(cfg)
+        settings["output_name"] = known[name]
+        sunshine_api(cfg, "POST", "/api/config", settings)
+        try:
+            sunshine_api(cfg, "POST", "/api/restart", {})
+        except OSError:
+            pass
+        wait_sunshine_restart(cfg)
+        cache.pop("output", None)
     if name == "obs":
         obs_show(cfg)
-    with state_lock:
-        state["display"] = name
+    else:
+        obs_leave(cfg)
+    set_state(display=name)
 
 
-def start(cfg, display=""):
+def session_file():
+    return Path(f"/run/user/{os.getuid()}/galaxy-session.env")
+
+
+def read_session():
+    result = {}
+    try:
+        for line in session_file().read_text().splitlines():
+            key, _, value = line.partition("=")
+            result[key] = value.strip('"')
+    except OSError:
+        pass
+    audio = ""
+    for mode, (flags, driver) in AUDIO_MODES.items():
+        if result.get("AUDIO_FLAGS") == flags and result.get("AUDIO_DRIVER") == driver:
+            audio = mode
+    return {"app": result.get("SUNSHINE_APP", ""), "audio": audio}
+
+
+def write_session(cfg, app, audio, resolution):
+    if audio not in AUDIO_MODES:
+        raise RuntimeError(f"unknown audio mode '{audio}', choose from: {', '.join(AUDIO_MODES)}")
+    if app not in apps(cfg) and app != cfg["SUNSHINE_APP"]:
+        raise RuntimeError(f"unknown app '{app}', choose from: {', '.join(apps(cfg))}")
+    if not RESOLUTION.match(resolution):
+        raise RuntimeError(f"invalid resolution '{resolution}'")
+    if any(char in app for char in '"\\$\n') or app.startswith("-"):
+        raise RuntimeError("invalid app name")
+    flags, driver = AUDIO_MODES[audio]
+    path = session_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'SUNSHINE_APP="{app}"\nAUDIO_FLAGS="{flags}"\nAUDIO_DRIVER={driver}\nRESOLUTION_FLAGS="--resolution {resolution}"\n'
+    )
+
+
+def confirm_stream(seconds=10):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if not stream_active():
+            raise RuntimeError("Moonlight exited right after starting, check: journalctl -u galaxy-stream")
+        time.sleep(1)
+
+
+def validate_options(cfg, display, audio, app):
+    if display and display not in displays(cfg):
+        raise ValueError(f"unknown display '{display}', choose from: {', '.join(displays(cfg)) or 'none configured'}")
+    if audio and audio not in AUDIO_MODES:
+        raise ValueError(f"unknown audio mode '{audio}', choose from: {', '.join(AUDIO_MODES)}")
+    if app and app not in apps(cfg):
+        raise ValueError(f"unknown app '{app}', choose from: {', '.join(apps(cfg))}")
+
+
+def start(cfg, display="", audio="", app="", fresh=False):
     if not cfg["PC_HOST"]:
         raise RuntimeError("PC_HOST is not configured")
-    if not job_lock.acquire(blocking=False):
-        raise RuntimeError("another action is running")
-    try:
-        if display and not stream_active():
-            set_phase("display")
-            select_display(cfg, display)
-        if stream_active():
+    validate_options(cfg, display, audio, app)
+    fresh = fresh or bool(display or audio or app)
+    if stream_active():
+        if not fresh:
             set_phase("streaming")
             return
-        set_phase("tv")
-        tv(cfg, True)
+        systemctl("stop")
+    previous = read_session()
+    audio = audio or previous["audio"] or "both"
+    app = app or previous["app"] or cfg["SUNSHINE_APP"]
+    set_state(warning="")
+    set_phase("tv")
+    outcome = {}
+    tv_thread = threading.Thread(target=lambda: outcome.update(ok=tv(cfg, True)), daemon=True)
+    tv_thread.start()
+    if not sunshine_up(cfg):
+        set_phase("waking")
+        deadline = time.time() + int(cfg["BOOT_WAIT"])
+        while time.time() < deadline and not sunshine_up(cfg):
+            wake(cfg)
+            time.sleep(5)
         if not sunshine_up(cfg):
-            set_phase("waking")
-            deadline = time.time() + int(cfg["BOOT_WAIT"])
-            while time.time() < deadline and not sunshine_up(cfg):
-                wake(cfg)
-                time.sleep(5)
-            if not sunshine_up(cfg):
-                raise RuntimeError("PC did not come up")
-        set_phase("connecting")
-        result = systemctl("start")
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "stream unit failed to start")
-        set_phase("streaming")
-    except Exception as error:
-        set_phase("error", str(error))
-        raise
-    finally:
-        job_lock.release()
+            raise RuntimeError("PC did not come up")
+    if display:
+        set_phase("display")
+        select_display(cfg, display)
+    chosen = display or display_name(cfg, True) or "tv"
+    resolution = pairs(cfg["DISPLAY_RES"]).get(chosen, "1920x1080")
+    write_session(cfg, app, audio, resolution)
+    tv_thread.join(timeout=120)
+    if not outcome.get("ok", True):
+        set_state(warning="The TV did not confirm that it is on")
+    set_phase("connecting")
+    result = systemctl("start")
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "stream unit failed to start")
+    confirm_stream()
+    set_phase("streaming")
 
 
 def stop(cfg):
-    if not job_lock.acquire(blocking=False):
-        raise RuntimeError("another action is running")
-    try:
-        set_phase("stopping")
-        systemctl("stop")
-        if flag(cfg, "TV_OFF_ON_STOP"):
-            tv(cfg, False)
-        set_phase("idle")
-    except Exception as error:
-        set_phase("error", str(error))
-        raise
-    finally:
-        job_lock.release()
+    set_phase("stopping")
+    systemctl("stop")
+    if flag(cfg, "TV_OFF_ON_STOP"):
+        tv(cfg, False)
+    set_phase("idle")
 
 
 def status(cfg):
     active = stream_active()
     with state_lock:
         snapshot = dict(state)
-    if snapshot["phase"] == "streaming" and not active:
-        snapshot["phase"] = "idle"
-    if active and snapshot["phase"] == "idle":
-        snapshot["phase"] = "streaming"
+    phase = snapshot["phase"]
+    error = snapshot["error"]
+    if phase == "streaming" and not active and not job_lock.locked():
+        phase, error = "error", "The stream ended unexpectedly"
+        set_phase(phase, error)
+    elif active and phase in ("idle", "error") and not job_lock.locked():
+        phase, error = "streaming", ""
+    session = read_session()
+    online = cached("online", 3, lambda: sunshine_up(cfg))
     return {
-        "phase": snapshot["phase"],
-        "error": snapshot["error"],
+        "phase": phase,
+        "error": error,
+        "warning": snapshot["warning"],
         "stream": active,
-        "pc_online": sunshine_up(cfg) if cfg["PC_HOST"] else False,
-        "pc_host": cfg["PC_HOST"],
-        "app": cfg["SUNSHINE_APP"],
-        "display": snapshot.get("display", ""),
-        "displays": list(displays(cfg)),
         "busy": job_lock.locked(),
+        "pc_online": online,
+        "pc_host": cfg["PC_HOST"],
+        "app": session["app"] or cfg["SUNSHINE_APP"],
+        "apps": apps(cfg),
+        "audio": session["audio"] or "both",
+        "audio_modes": list(AUDIO_MODES),
+        "display": display_name(cfg, online) if online else snapshot["display"],
+        "displays": list(displays(cfg)),
     }
 
 
-def run_async(function, *args):
-    def target():
-        try:
-            function(*args)
-        except Exception as error:
-            log(f"{function.__name__} failed: {error}")
-
-    threading.Thread(target=target, daemon=True).start()
-
-
-PAGE = """<!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Galaxy</title>
-<style>
-:root{color-scheme:dark light;font-family:system-ui,sans-serif}
-body{margin:0;display:grid;place-items:center;min-height:100vh;background:#0e1020;color:#e8e8f0}
-main{width:min(92vw,420px);display:grid;gap:14px}
-h1{margin:0;font-size:1.4rem}
-#s{padding:12px 14px;border-radius:10px;background:#1a1d36}
-button{padding:14px;border:0;border-radius:10px;background:#4b5cff;color:#fff;font-size:1rem}
-button.alt{background:#2a2e55}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-input{padding:12px;border-radius:10px;border:1px solid #34396b;background:#12142a;color:inherit}
-</style>
-<main>
-<h1>Galaxy</h1>
-<div id="s">...</div>
-<div class="row"><button onclick="call('start')">Start</button><button class="alt" onclick="call('stop')">Stop</button></div>
-<div class="row"><button class="alt" onclick="call('wake')">Wake PC</button><button class="alt" onclick="call('sleep')">Sleep PC</button></div>
-<div class="row" id="d"></div>
-<div class="row"><button class="alt" onclick="call('tv/on')">TV on</button><button class="alt" onclick="call('tv/off')">TV off</button></div>
-<input id="t" type="password" placeholder="API token" onchange="localStorage.setItem('t',this.value)">
-</main>
-<script>
-const t=document.getElementById('t');t.value=localStorage.getItem('t')||'';
-const h=()=>({Authorization:'Bearer '+t.value});
-async function call(p){await fetch('/v1/'+p,{method:'POST',headers:h()});refresh()}
-async function refresh(){try{const r=await fetch('/v1/status',{headers:h()});const j=await r.json();
-document.getElementById('s').textContent=r.ok?j.phase+' | PC '+(j.pc_online?'online':'offline')+(j.display?' | '+j.display:'')+(j.error?' | '+j.error:''):'unauthorized';if(r.ok)document.getElementById('d').innerHTML=j.displays.map(n=>`<button class="alt" onclick="call('display/${n}')">${n}</button>`).join('')}catch(e){}}
-refresh();setInterval(refresh,3000);
-</script>
-"""
+def set_env(key, value):
+    if key not in DEFAULTS:
+        raise RuntimeError(f"unknown setting '{key}'")
+    if "\n" in value:
+        raise RuntimeError("value must be one line")
+    lines = ENV_FILE.read_text().splitlines() if ENV_FILE.is_file() else []
+    out, found = [], False
+    for line in lines:
+        if line.startswith(f"{key}="):
+            line, found = f"{key}={value}", True
+        out.append(line)
+    if not found:
+        out.append(f"{key}={value}")
+    prefix = [] if os.geteuid() == 0 else ["sudo", "-n"]
+    subprocess.run(prefix + ["tee", str(ENV_FILE)], input=("\n".join(out) + "\n").encode(), stdout=subprocess.DEVNULL, check=True)
 
 
 def make_handler(cfg):
@@ -446,48 +646,77 @@ def make_handler(cfg):
             self.end_headers()
             self.wfile.write(data)
 
-        def query(self):
-            from urllib.parse import parse_qs, urlparse
-
-            return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
-
         def authorized(self):
             header = self.headers.get("Authorization", "")
-            supplied = header[7:].encode() if header.startswith("Bearer ") else b""
-            return bool(token) and hmac.compare_digest(supplied, token)
+            supplied = header[7:].encode() if header.lower().startswith("bearer ") else b""
+            if bool(token) and hmac.compare_digest(supplied, token):
+                return True
+            time.sleep(0.3)
+            self.reply(401, {"error": "unauthorized"})
+            return False
+
+        def body(self):
+            try:
+                size = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                raise ValueError("bad Content-Length")
+            if size > MAX_BODY:
+                raise ValueError("body too large")
+            data = json.loads(self.rfile.read(size) or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError("body must be a JSON object")
+            return data
 
         def do_GET(self):
-            if self.path == "/":
-                return self.reply(200, PAGE.encode(), "text/html; charset=utf-8")
+            route = urlparse(self.path).path
+            if route == "/":
+                return self.reply(200, (ROOT / "web" / "index.html").read_bytes(), "text/html; charset=utf-8")
             if not self.authorized():
-                return self.reply(401, {"error": "unauthorized"})
-            if self.path == "/v1/status":
+                return
+            if route == "/v1/status":
                 return self.reply(200, status(cfg))
             self.reply(404, {"error": "not found"})
 
         def do_POST(self):
             if not self.authorized():
-                return self.reply(401, {"error": "unauthorized"})
-            route = self.path.split("?", 1)[0]
+                return
+            parsed = urlparse(self.path)
+            route = parsed.path
             try:
-                if route == "/v1/start":
-                    run_async(start, cfg, self.query().get("display", ""))
+                if route == "/v1/connect":
+                    options = self.body()
+                elif route == "/v1/start":
+                    options = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+                else:
+                    options = {}
+                if route in ("/v1/connect", "/v1/start"):
+                    for key in ("display", "audio", "app"):
+                        if not isinstance(options.get(key, ""), str):
+                            raise ValueError(f"{key} must be a string")
+                    display, audio, app = options.get("display", ""), options.get("audio", ""), options.get("app", "")
+                    validate_options(cfg, display, audio, app)
+                    submit(start, cfg, display, audio, app, route == "/v1/connect")
                 elif route.startswith("/v1/display/"):
-                    run_async(select_display, cfg, route[len("/v1/display/"):])
+                    name = route[len("/v1/display/"):]
+                    if name not in displays(cfg):
+                        raise ValueError(f"unknown display '{name}'")
+                    submit(select_display, cfg, name)
                 elif route == "/v1/stop":
-                    run_async(stop, cfg)
+                    submit(stop, cfg)
                 elif route == "/v1/wake":
                     wake(cfg)
-                elif route == "/v1/tv/on":
-                    run_async(tv, cfg, True)
-                elif route == "/v1/tv/off":
-                    run_async(tv, cfg, False)
+                elif route in ("/v1/tv/on", "/v1/tv/off"):
+                    submit(tv, cfg, route.endswith("on"), report=False)
                 elif route.startswith("/v1/") and route[4:] in PC_COMMANDS:
                     pc_power(cfg, route[4:])
                 else:
                     return self.reply(404, {"error": "not found"})
+            except Busy as error:
+                return self.reply(409, {"error": str(error)})
+            except (ValueError, KeyError) as error:
+                return self.reply(400, {"error": str(error)})
             except Exception as error:
-                return self.reply(500, {"error": str(error)})
+                return self.reply(502, {"error": str(error)})
             self.reply(202, {"accepted": route})
 
     return Handler
@@ -510,39 +739,46 @@ def pair(cfg):
 def main():
     parser = argparse.ArgumentParser(prog="galaxy")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "start", "stop", "status", "wake", "pair", *PC_COMMANDS):
+    for name in ("serve", "stop", "status", "wake", "pair", *PC_COMMANDS):
         sub.add_parser(name)
-    start_parser = sub.choices["start"]
+    start_parser = sub.add_parser("start")
     start_parser.add_argument("--display", default="")
+    start_parser.add_argument("--audio", default="", choices=("", *AUDIO_MODES))
+    start_parser.add_argument("--app", default="")
     display_parser = sub.add_parser("display")
     display_parser.add_argument("name", nargs="?")
     tv_parser = sub.add_parser("tv")
     tv_parser.add_argument("state", choices=("on", "off"))
+    set_parser = sub.add_parser("set")
+    set_parser.add_argument("key", choices=SECRET_KEYS)
     args = parser.parse_args()
     cfg = load_config()
     try:
         if args.command == "serve":
             serve(cfg)
         elif args.command == "start":
-            start(cfg, args.display)
-        elif args.command == "display":
-            if args.name:
-                select_display(cfg, args.name)
-            else:
-                print(json.dumps(displays(cfg), indent=2))
+            exclusive(start, cfg, args.display, args.audio, args.app)
         elif args.command == "stop":
-            stop(cfg)
+            exclusive(stop, cfg)
         elif args.command == "status":
             print(json.dumps(status(cfg), indent=2))
         elif args.command == "wake":
             wake(cfg)
         elif args.command == "pair":
             pair(cfg)
+        elif args.command == "display":
+            if args.name:
+                exclusive(select_display, cfg, args.name)
+            else:
+                print(json.dumps(displays(cfg), indent=2))
         elif args.command == "tv":
-            tv(cfg, args.state == "on")
+            exclusive(tv, cfg, args.state == "on")
+        elif args.command == "set":
+            set_env(args.key, getpass.getpass(f"{args.key}: "))
+            print("saved")
         else:
             pc_power(cfg, args.command)
-    except (RuntimeError, ValueError) as error:
+    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
         sys.exit(f"galaxy: {error}")
 
 
