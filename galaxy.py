@@ -35,7 +35,8 @@ DEFAULTS = {
     "SUNSHINE_USER": "",
     "SUNSHINE_PASS": "",
     "DISPLAYS": "",
-    "DISPLAY_RES": "main=3840x1080,tv=1920x1080,obs=1920x1080",
+    "DISPLAY_RES": "main=3840x1080,second=1920x1080,obs=1920x1080",
+    "OBS_SOURCE": "off",
     "OBS_PORT": "4455",
     "OBS_PASS": "",
     "OBS_MONITOR": "1",
@@ -235,8 +236,8 @@ def pc_power(cfg, action):
 
 def displays(cfg):
     result = pairs(cfg["DISPLAYS"])
-    if cfg["OBS_PASS"] and "tv" in result:
-        result["obs"] = result["tv"]
+    if cfg["OBS_SOURCE"] == "projector" and cfg["OBS_PASS"] and "second" in result:
+        result["obs"] = result["second"]
     return result
 
 
@@ -561,7 +562,7 @@ def start(cfg, display="", audio="", app="", fresh=False):
     if display:
         set_phase("display")
         select_display(cfg, display)
-    chosen = display or display_name(cfg, True) or "tv"
+    chosen = display or display_name(cfg, True) or "main"
     resolution = pairs(cfg["DISPLAY_RES"]).get(chosen, "1920x1080")
     write_session(cfg, app, audio, resolution)
     tv_thread.join(timeout=120)

@@ -98,7 +98,7 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 <script>
 const LABELS = {
   main: ["Main screen", "Wide monitor, shown with bars on the TV"],
-  tv: ["TV screen", "Second monitor, full HD"],
+  second: ["Second screen", "Full HD monitor, fills the TV"],
   obs: ["OBS output", "What OBS is sending"],
   both: ["PC + TV", "Sound on both"],
   pc: ["PC only", "TV stays quiet"],
@@ -165,7 +165,7 @@ function draw() {
   if (!current) return;
   const streaming = current.stream;
   const locked = pending || current.busy;
-  if (!current.displays.includes(choice.display)) choice.display = current.displays.includes("tv") ? "tv" : current.displays[0] || "";
+  if (!current.displays.includes(choice.display)) choice.display = current.displays.includes("main") ? "main" : current.displays[0] || "";
   if (!current.apps.includes(choice.app)) choice.app = current.apps[0] || "";
   render("displays", current.displays, "display", (n) => LABELS[n] || [n, ""], locked);
   render("apps", current.apps, "app", (n) => [n, ""], locked);
