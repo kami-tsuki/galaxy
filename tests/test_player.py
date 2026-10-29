@@ -26,7 +26,7 @@ class WriteSessionTests(SessionFileCase):
         player.write_session(make_cfg(), "Desktop", "tv", "1920x1080", self.path)
         self.assertEqual(
             self.path.read_text(),
-            'SUNSHINE_APP="Desktop"\nAUDIO_FLAGS="--no-audio-on-host"\nAUDIO_DRIVER=alsa\n'
+            'SUNSHINE_APP="Desktop"\nAUDIO_FLAGS="--no-audio-on-host"\nAUDIO_DRIVER=pulseaudio\n'
             'RESOLUTION_FLAGS="--resolution 1920x1080"\n',
         )
 
@@ -65,7 +65,7 @@ class ReadSessionTests(SessionFileCase):
 
     def test_unrecognised_audio_flags_yield_empty_audio(self):
         self.path.parent.mkdir(parents=True)
-        self.path.write_text('SUNSHINE_APP="X"\nAUDIO_FLAGS="--foo"\nAUDIO_DRIVER=alsa\n')
+        self.path.write_text('SUNSHINE_APP="X"\nAUDIO_FLAGS="--foo"\nAUDIO_DRIVER=pulseaudio\n')
         self.assertEqual(player.read_session(self.path), {"app": "X", "audio": ""})
 
     def test_default_path_uses_user_runtime_dir(self):

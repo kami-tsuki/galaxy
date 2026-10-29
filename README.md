@@ -84,7 +84,7 @@ Each screen has a stream resolution in `DISPLAY_RES`, so the picture keeps its p
 | `tv` | plays | muted by Moonlight |
 | `pc` | silent | plays |
 
-Moonlight runs on the Pi with ALSA directly (no sound server), writing to `AUDIO_DEVICE`, the HDMI port the TV is on. The connected port shows a monitor name in `/proc/asound/cardN/eld#0.0`. The chosen mode is written for each session to `/run/user/<uid>/galaxy-session.env`; `AUDIO_FLAGS`, `AUDIO_DRIVER` and `RESOLUTION_FLAGS` in `galaxy.env` are only the defaults for a manual start.
+Moonlight's sound library only supports PipeWire and PulseAudio, so `setup.sh` installs PipeWire with its PulseAudio bridge for the user and Moonlight (Flatpak) plays through it. The Pi's only connected HDMI port is the default output. `PC only` sets Moonlight's audio driver to `dummy`, so nothing plays on the TV. The chosen mode is written for each session to `/run/user/<uid>/galaxy-session.env`; `AUDIO_FLAGS`, `AUDIO_DRIVER` and `RESOLUTION_FLAGS` in `galaxy.env` are only the defaults for a manual start.
 
 ## OBS source
 
@@ -112,7 +112,7 @@ On Disconnect it stops the OBS stream and switches OBS back to the profile you w
 | `OBS_ENABLED`, `OBS_PASS`, `OBS_PORT`, `OBS_PROFILE`, `OBS_BITRATE`, `OBS_FPS` | OBS source |
 | `SRT_PORT`, `PI_HOST` | SRT listener port; the Pi's address as seen from the PC (detected when empty) |
 | `TV_CEC`, `TV_OFF_ON_STOP`, `CEC_DEVICE`, `BOOT_WAIT` | CEC control (`CEC_DEVICE` is the `/dev/cecN` of the HDMI port in use), seconds to wait for the PC |
-| `MOONLIGHT_ARGS`, `AUDIO_DEVICE` | extra Moonlight options; ALSA device of the TV, for example `plughw:CARD=vc4hdmi1,DEV=0` |
+| `MOONLIGHT_ARGS` | extra Moonlight options |
 | `API_BIND`, `API_PORT`, `API_TOKEN` | HTTP API; set `API_BIND` to the Pi's LAN address to avoid listening on every interface |
 
 ## CLI
@@ -146,6 +146,7 @@ Plain HTTP with `Authorization: Bearer <API_TOKEN>`; keep it on the home network
 
 ## Notes
 
+- The desktop portal services are masked for the user: Moonlight waits for them on every start, which delayed it by more than a minute on a Pi without a desktop.
 - The player units clear the inheritable capability set with `setpriv`, because the login session grants one and Flatpak's sandbox refuses to start with it.
 - After a stop the login prompt returns on tty1; with `TV_OFF_ON_STOP=true` the TV is off anyway.
 - `sleep` uses `SetSuspendState`, which hibernates if hibernation is enabled in Windows.

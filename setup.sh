@@ -8,10 +8,11 @@ if [ "$TARGET_USER" = "root" ]; then
     exit 1
 fi
 TARGET_UID="$(id -u "$TARGET_USER")"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 UNITS="galaxy.service galaxy-stream.service galaxy-obs.service"
 
 sudo apt-get update
-sudo apt-get install -y cage flatpak mpv cec-utils python3 openssh-client util-linux
+sudo apt-get install -y cage flatpak mpv cec-utils python3 openssh-client util-linux pipewire pipewire-pulse wireplumber pulseaudio-utils
 
 sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 sudo flatpak install -y --noninteractive flathub com.moonlight_stream.Moonlight
@@ -31,7 +32,7 @@ else
 fi
 
 for unit in $UNITS; do
-    sed -e "s|@USER@|$TARGET_USER|g" -e "s|@UID@|$TARGET_UID|g" -e "s|@DIR@|$DIR|g" "$DIR/systemd/$unit" \
+    sed -e "s|@USER@|$TARGET_USER|g" -e "s|@UID@|$TARGET_UID|g" -e "s|@DIR@|$DIR|g" -e "s|@HOME@|$TARGET_HOME|g" "$DIR/systemd/$unit" \
         | sudo tee "/etc/systemd/system/$unit" >/dev/null
 done
 
@@ -46,6 +47,10 @@ sudo chmod 0440 /etc/sudoers.d/galaxy
 sudo visudo -cf /etc/sudoers.d/galaxy
 
 sudo loginctl enable-linger "$TARGET_USER"
+until [ -d "/run/user/$TARGET_UID" ]; do sleep 1; done
+user_ctl() { sudo -u "$TARGET_USER" XDG_RUNTIME_DIR="/run/user/$TARGET_UID" systemctl --user "$@"; }
+user_ctl enable --now pipewire.socket pipewire-pulse.socket wireplumber.service
+user_ctl mask xdg-desktop-portal.service xdg-desktop-portal-gtk.service
 sudo systemctl daemon-reload
 sudo systemctl enable galaxy.service
 sudo systemctl restart galaxy.service

@@ -10,8 +10,8 @@ MOONLIGHT = "galaxy-stream.service"
 OBS = "galaxy-obs.service"
 UNITS = (MOONLIGHT, OBS)
 AUDIO_MODES = {
-    "both": ("--audio-on-host", "alsa"),
-    "tv": ("--no-audio-on-host", "alsa"),
+    "both": ("--audio-on-host", "pulseaudio"),
+    "tv": ("--no-audio-on-host", "pulseaudio"),
     "pc": ("--audio-on-host", "dummy"),
 }
 RESOLUTION = re.compile(r"^\d{3,5}x\d{3,5}$")
