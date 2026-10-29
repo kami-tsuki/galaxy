@@ -229,7 +229,9 @@ class Ws:
             if opcode == 1:
                 return json.loads(payload)
             if opcode == 8:
-                raise RuntimeError("OBS closed the connection")
+                code = int.from_bytes(payload[:2], "big") if len(payload) >= 2 else 0
+                reason = {4009: "authentication failed, check OBS_PASS", 4008: "OBS rejected the identify message"}.get(code, f"code {code}")
+                raise RuntimeError(f"OBS closed the connection ({reason})")
 
 
 def obs_request(cfg, request_type, data=None):
