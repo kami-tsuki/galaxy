@@ -17,7 +17,7 @@ class MagicPacketTests(unittest.TestCase):
         self.assertEqual(pc.magic_packet("AA-BB-CC-DD-EE-01"), b"\xff" * 6 + bytes.fromhex("aabbccddee01") * 16)
 
     def test_invalid_macs_are_rejected(self):
-        for mac in ("", "aa:bb:cc:dd:ee", "aa:bb:cc:dd:ee:ff:00", "gg:bb:cc:dd:ee:ff", "aabbccddeeff"):
+        for mac in ("", "aa:bb:cc:dd:ee", "aa:bb:cc:dd:ee:ff:00", "gg:bb:cc:dd:ee:ff", "aabbccddeeff", "aa:bb:cc:dd:ee:ff\n"):
             with self.assertRaisesRegex(RuntimeError, "MAC"):
                 pc.magic_packet(mac)
 
@@ -105,6 +105,24 @@ class BootTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             pc.boot(make_cfg(BOOT_WAIT="0"))
         self.wake.assert_not_called()
+
+    def test_stop_before_first_wake_returns_without_error(self):
+        self.sunshine_up.return_value = False
+        pc.boot(make_cfg(), stop=lambda: True)
+        self.wake.assert_not_called()
+
+    def test_stop_during_wait_ends_boot_without_raising(self):
+        self.sunshine_up.return_value = False
+        on_wait = mock.Mock()
+        pc.boot(make_cfg(BOOT_WAIT="1000"), on_wait, lambda: self.wake.call_count >= 2)
+        on_wait.assert_called_once_with()
+        self.assertEqual(self.wake.call_count, 2)
+
+    def test_stop_is_not_consulted_when_pc_is_already_up(self):
+        self.sunshine_up.return_value = True
+        stop = mock.Mock(return_value=True)
+        pc.boot(make_cfg(), stop=stop)
+        stop.assert_not_called()
 
     def test_default_on_wait_is_a_no_op(self):
         self.sunshine_up.side_effect = [False, False, True, True]

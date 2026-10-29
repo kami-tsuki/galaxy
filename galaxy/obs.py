@@ -4,15 +4,20 @@ import json
 import os
 import socket
 import time
-from pathlib import Path
 
+from . import config
 from .log import log
 
 CLOSE_REASONS = {4009: "authentication failed, check OBS_PASS", 4008: "OBS rejected the identify message"}
 
 
+MAX_FRAME = 1 << 20
+CANVAS = (1920, 1080)
+AUDIO_BITRATE = "160"
+
+
 def previous_profile_file():
-    return Path(f"/run/user/{os.getuid()}/galaxy-obs-previous")
+    return config.runtime_dir() / "galaxy-obs-previous"
 
 
 def auth_response(password, salt, challenge):
@@ -80,6 +85,7 @@ class Ws:
         self.send_frame(1, json.dumps(message).encode())
 
     def recv(self):
+        message = b""
         while True:
             first, second = self.read(2)
             size = second & 0x7F
@@ -87,11 +93,15 @@ class Ws:
                 size = int.from_bytes(self.read(2), "big")
             elif size == 127:
                 size = int.from_bytes(self.read(8), "big")
+            if size > MAX_FRAME:
+                raise RuntimeError("OBS sent an oversized message")
             payload = self.read(size)
             opcode = first & 0x0F
-            if opcode == 1:
-                return json.loads(payload)
-            if opcode == 9:
+            if opcode in (0, 1):
+                message += payload
+                if first & 0x80:
+                    return json.loads(message)
+            elif opcode == 9:
                 self.send_frame(10, payload)
             elif opcode == 8:
                 code = int.from_bytes(payload[:2], "big") if len(payload) >= 2 else 0
@@ -163,8 +173,41 @@ def profile_parameters(cfg):
     return (
         ("Output", "Mode", "Simple"),
         ("SimpleOutput", "VBitrate", cfg["OBS_BITRATE"]),
-        ("SimpleOutput", "ABitrate", "160"),
+        ("SimpleOutput", "ABitrate", AUDIO_BITRATE),
     )
+
+
+def wait_camera(client, wanted, seconds=5):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if client.call("GetVirtualCamStatus")["outputActive"] == wanted:
+            return
+        time.sleep(0.5)
+
+
+def apply_canvas(client, cfg):
+    wanted = {
+        "baseWidth": CANVAS[0],
+        "baseHeight": CANVAS[1],
+        "outputWidth": CANVAS[0],
+        "outputHeight": CANVAS[1],
+        "fpsNumerator": int(cfg["OBS_FPS"]),
+        "fpsDenominator": 1,
+    }
+    current = client.call("GetVideoSettings")
+    if all(current.get(key) == value for key, value in wanted.items()):
+        return
+    camera = client.call("GetVirtualCamStatus")["outputActive"]
+    if camera:
+        client.call("StopVirtualCam")
+        wait_camera(client, False)
+    try:
+        client.call("SetVideoSettings", wanted)
+    except RuntimeError as error:
+        raise RuntimeError(f"OBS cannot change its video settings, stop any recording or stream in OBS first ({error})")
+    finally:
+        if camera:
+            client.call("StartVirtualCam")
 
 
 def begin(cfg, url):
@@ -177,18 +220,7 @@ def begin(cfg, url):
         if info["currentProfileName"] != name:
             previous_profile_file().write_text(info["currentProfileName"])
             client.call("SetCurrentProfile" if name in info["profiles"] else "CreateProfile", {"profileName": name})
-        fps = int(cfg["OBS_FPS"])
-        client.call(
-            "SetVideoSettings",
-            {
-                "baseWidth": 1920,
-                "baseHeight": 1080,
-                "outputWidth": 1920,
-                "outputHeight": 1080,
-                "fpsNumerator": fps,
-                "fpsDenominator": 1,
-            },
-        )
+        apply_canvas(client, cfg)
         for category, parameter, value in profile_parameters(cfg):
             client.call(
                 "SetProfileParameter",

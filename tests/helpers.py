@@ -5,11 +5,15 @@ import json
 import socket
 import threading
 import time
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from galaxy import config, jobs
 
 real_sleep = time.sleep
+TOKEN = "t" * config.MIN_TOKEN_LENGTH
 
 
 def make_cfg(**overrides):
@@ -21,7 +25,7 @@ def make_cfg(**overrides):
         DISPLAYS="main=dev-main,second=dev-second",
         SUNSHINE_USER="user",
         SUNSHINE_PASS="pass",
-        API_TOKEN="secret-token",
+        API_TOKEN=TOKEN,
     )
     cfg.update(overrides)
     return cfg
@@ -29,7 +33,8 @@ def make_cfg(**overrides):
 
 def reset_jobs():
     jobs._cache.clear()
-    jobs.update(phase="idle", error="", warning="", source="", obs_active=False)
+    jobs.update(phase="idle", error="", warning="", source="", obs_active=False, intent="down", request={})
+    jobs.clear_cancel()
     if jobs._job_lock.locked():
         jobs._job_lock.release()
 
@@ -184,3 +189,22 @@ class FakeObsServer:
     @staticmethod
     def send_json(conn, message):
         conn.sendall(server_frame(1, json.dumps(message).encode()))
+
+
+def start_patch(case, target, name, **kwargs):
+    patcher = mock.patch.object(target, name, **kwargs)
+    mocked = patcher.start()
+    case.addCleanup(patcher.stop)
+    return mocked
+
+
+class TempDirCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def write(self, name, text):
+        path = self.dir / name
+        path.write_text(text)
+        return path

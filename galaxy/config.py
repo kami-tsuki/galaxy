@@ -17,6 +17,7 @@ DEFAULTS = {
     "SUNSHINE_UI_PORT": "47990",
     "SUNSHINE_USER": "",
     "SUNSHINE_PASS": "",
+    "SUNSHINE_CERT_SHA256": "",
     "DISPLAYS": "",
     "DISPLAY_RES": "main=3840x1080,second=1920x1080",
     "OBS_ENABLED": "false",
@@ -31,11 +32,20 @@ DEFAULTS = {
     "TV_CEC": "true",
     "TV_OFF_ON_STOP": "true",
     "CEC_DEVICE": "/dev/cec1",
+    "WATCHDOG": "true",
     "API_BIND": "0.0.0.0",
     "API_PORT": "8787",
     "API_TOKEN": "",
 }
 SECRETS = ("SUNSHINE_USER", "SUNSHINE_PASS", "OBS_PASS", "API_TOKEN")
+SETTABLE = SECRETS + ("SUNSHINE_CERT_SHA256",)
+UNSAFE = {"": '"\\\n\r', "secret": "\"'\\$#\n\r"}
+OBS_SOURCE = "obs"
+MIN_TOKEN_LENGTH = 24
+
+
+def runtime_dir():
+    return Path(f"/run/user/{os.getuid()}")
 
 
 def load(paths=ENV_FILES, environ=None):
@@ -71,7 +81,7 @@ def pairs(text):
 
 
 def screens(cfg):
-    return pairs(cfg["DISPLAYS"])
+    return {name: ident for name, ident in pairs(cfg["DISPLAYS"]).items() if ident and name != OBS_SOURCE}
 
 
 def apps(cfg):
@@ -85,15 +95,16 @@ def obs_enabled(cfg):
 def sources(cfg):
     names = list(screens(cfg))
     if obs_enabled(cfg):
-        names.append("obs")
+        names.append(OBS_SOURCE)
     return names
 
 
-def save_secret(key, value, path=ENV_FILE):
-    if key not in SECRETS:
+def save_setting(key, value, path=ENV_FILE):
+    if key not in SETTABLE:
         raise RuntimeError(f"'{key}' cannot be set this way")
-    if "\n" in value or "\r" in value:
-        raise RuntimeError("value must be one line")
+    forbidden = UNSAFE["secret" if key in SECRETS else ""]
+    if any(char in value for char in forbidden):
+        raise RuntimeError("value contains a character that cannot be stored, avoid: " + " ".join(repr(c)[1:-1] for c in forbidden))
     path = Path(path)
     lines = path.read_text().splitlines() if path.is_file() else []
     out, found = [], False
@@ -103,7 +114,7 @@ def save_secret(key, value, path=ENV_FILE):
         out.append(line)
     if not found:
         out.append(f"{key}={value}")
-    prefix = [] if os.geteuid() == 0 else ["sudo", "-n"]
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
     subprocess.run(
         prefix + ["tee", str(path)], input=("\n".join(out) + "\n").encode(), stdout=subprocess.DEVNULL, check=True
     )

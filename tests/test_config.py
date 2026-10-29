@@ -1,23 +1,9 @@
 import os
-import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from galaxy import config
-from tests.helpers import make_cfg
-
-
-class TempDirCase(unittest.TestCase):
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.dir = Path(tmp.name)
-
-    def write(self, name, text):
-        path = self.dir / name
-        path.write_text(text)
-        return path
+from tests.helpers import TempDirCase, make_cfg
 
 
 class LoadTests(TempDirCase):
@@ -84,6 +70,9 @@ class HelperTests(unittest.TestCase):
     def test_screens_reads_displays(self):
         self.assertEqual(config.screens(make_cfg(DISPLAYS="a=1,b=2")), {"a": "1", "b": "2"})
 
+    def test_screens_ignores_display_named_obs_and_empty_ids(self):
+        self.assertEqual(config.screens(make_cfg(DISPLAYS="main=1,obs=2,second=,third=3")), {"main": "1", "third": "3"})
+
     def test_apps_trims_and_drops_empty_items(self):
         self.assertEqual(config.apps(make_cfg(APPS=" Desktop, ,Steam Big Picture,")), ["Desktop", "Steam Big Picture"])
 
@@ -104,7 +93,7 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(config.sources(make_cfg(DISPLAYS="")), [])
 
 
-class SaveSecretTests(TempDirCase):
+class SaveSettingTests(TempDirCase):
     def setUp(self):
         super().setUp()
         run_patch = mock.patch.object(config.subprocess, "run")
@@ -118,20 +107,45 @@ class SaveSecretTests(TempDirCase):
         self.run.assert_called_once()
         return self.run.call_args
 
-    def test_rejects_unknown_key(self):
+    def test_rejects_key_that_is_not_settable(self):
         with self.assertRaisesRegex(RuntimeError, "cannot be set"):
-            config.save_secret("PC_HOST", "x", self.dir / "e.env")
+            config.save_setting("PC_HOST", "x", self.dir / "e.env")
         self.run.assert_not_called()
 
-    def test_rejects_newline_and_carriage_return(self):
-        for value in ("a\nb", "a\rb"):
-            with self.assertRaisesRegex(RuntimeError, "one line"):
-                config.save_secret("API_TOKEN", value, self.dir / "e.env")
+    def test_every_settable_key_is_accepted(self):
+        self.assertEqual(set(config.SETTABLE), set(config.SECRETS) | {"SUNSHINE_CERT_SHA256"})
+        for key in config.SETTABLE:
+            self.run.reset_mock()
+            config.save_setting(key, "value", self.dir / "e.env")
+            self.run.assert_called_once()
+
+    def test_every_value_rejects_quote_backslash_newline_and_carriage_return(self):
+        for key in config.SETTABLE:
+            for char in ('"', chr(92), chr(10), chr(13)):
+                with self.assertRaisesRegex(RuntimeError, "cannot be stored"):
+                    config.save_setting(key, f"a{char}b", self.dir / "e.env")
         self.run.assert_not_called()
+
+    def test_secrets_also_reject_single_quote_dollar_and_hash(self):
+        for key in config.SECRETS:
+            for char in "'$#":
+                with self.assertRaises(RuntimeError):
+                    config.save_setting(key, f"a{char}b", self.dir / "e.env")
+        self.run.assert_not_called()
+
+    def test_certificate_fingerprint_may_contain_characters_forbidden_in_secrets(self):
+        config.save_setting("SUNSHINE_CERT_SHA256", "ab$#'cd", self.dir / "e.env")
+        self.assertEqual(self.sent().kwargs["input"], b"SUNSHINE_CERT_SHA256=ab$#'cd\n")
+
+    def test_error_message_lists_the_forbidden_characters(self):
+        with self.assertRaises(RuntimeError) as caught:
+            config.save_setting("API_TOKEN", "$", self.dir / "e.env")
+        self.assertIn("$", str(caught.exception))
+        self.assertIn("#", str(caught.exception))
 
     def test_replaces_existing_key_and_keeps_other_lines(self):
         path = self.write("e.env", "A=1\nSUNSHINE_PASS=old\nAPI_TOKEN_X=keep\nB=2\n")
-        config.save_secret("SUNSHINE_PASS", "new", path)
+        config.save_setting("SUNSHINE_PASS", "new", path)
         call = self.sent()
         self.assertEqual(call.args[0], ["tee", str(path)])
         self.assertEqual(call.kwargs["input"], b"A=1\nSUNSHINE_PASS=new\nAPI_TOKEN_X=keep\nB=2\n")
@@ -139,28 +153,41 @@ class SaveSecretTests(TempDirCase):
 
     def test_appends_key_when_missing(self):
         path = self.write("e.env", "A=1\n")
-        config.save_secret("API_TOKEN", "tok", path)
+        config.save_setting("API_TOKEN", "tok", path)
         self.assertEqual(self.sent().kwargs["input"], b"A=1\nAPI_TOKEN=tok\n")
 
     def test_creates_content_when_file_does_not_exist(self):
-        config.save_secret("OBS_PASS", "p", self.dir / "new.env")
+        config.save_setting("OBS_PASS", "p", self.dir / "new.env")
         self.assertEqual(self.sent().kwargs["input"], b"OBS_PASS=p\n")
 
-    def test_uses_sudo_when_not_root(self):
+    def test_uses_plain_sudo_when_not_root(self):
         self.euid.return_value = 1000
         path = self.write("e.env", "")
-        config.save_secret("API_TOKEN", "t", path)
-        self.assertEqual(self.sent().args[0], ["sudo", "-n", "tee", str(path)])
+        config.save_setting("API_TOKEN", "t", path)
+        self.assertEqual(self.sent().args[0], ["sudo", "tee", str(path)])
 
-    def test_value_is_written_verbatim_with_special_characters(self):
+    def test_spaces_and_equals_are_written_verbatim(self):
         path = self.write("e.env", "")
-        config.save_secret("SUNSHINE_PASS", 'p"a$s s=\\', path)
-        self.assertEqual(self.sent().kwargs["input"], b'SUNSHINE_PASS=p"a$s s=\\\n')
+        config.save_setting("SUNSHINE_PASS", "p a=s s", path)
+        self.assertEqual(self.sent().kwargs["input"], b"SUNSHINE_PASS=p a=s s\n")
 
     def test_propagates_tee_failure(self):
         self.run.side_effect = config.subprocess.CalledProcessError(1, "tee")
         with self.assertRaises(config.subprocess.CalledProcessError):
-            config.save_secret("API_TOKEN", "t", self.write("e.env", ""))
+            config.save_setting("API_TOKEN", "t", self.write("e.env", ""))
+
+
+class ConstantsTests(unittest.TestCase):
+    def test_runtime_dir_is_per_user(self):
+        with mock.patch.object(os, "getuid", create=True, return_value=1234):
+            self.assertEqual(config.runtime_dir(), config.Path("/run/user/1234"))
+
+    def test_new_defaults_exist(self):
+        self.assertEqual(config.DEFAULTS["WATCHDOG"], "true")
+        self.assertEqual(config.DEFAULTS["SUNSHINE_CERT_SHA256"], "")
+
+    def test_default_token_is_too_short_to_authorize(self):
+        self.assertLess(len(config.DEFAULTS["API_TOKEN"]), config.MIN_TOKEN_LENGTH)
 
 
 if __name__ == "__main__":

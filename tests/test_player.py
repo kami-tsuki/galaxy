@@ -1,62 +1,66 @@
 import itertools
 import os
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from galaxy import player
-from tests.helpers import make_cfg
+from tests.helpers import TempDirCase, start_patch
 
 
-class SessionFileCase(unittest.TestCase):
+class SessionFileCase(TempDirCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.path = Path(tmp.name) / "run" / "session.env"
+        super().setUp()
+        self.path = self.dir / "run" / "session.env"
 
 
 class WriteSessionTests(SessionFileCase):
     def test_round_trips_every_audio_mode(self):
         for mode in player.AUDIO_MODES:
-            player.write_session(make_cfg(), "Steam Big Picture", mode, "3840x1080", self.path)
+            player.write_session("Steam Big Picture", mode, "3840x1080", self.path)
             self.assertEqual(player.read_session(self.path), {"app": "Steam Big Picture", "audio": mode})
 
     def test_file_content_has_flags_driver_and_resolution(self):
-        player.write_session(make_cfg(), "Desktop", "tv", "1920x1080", self.path)
+        player.write_session("Desktop", "tv", "1920x1080", self.path)
         self.assertEqual(
             self.path.read_text(),
             'SUNSHINE_APP="Desktop"\nAUDIO_FLAGS="--no-audio-on-host"\nAUDIO_DRIVER=pulseaudio\n'
             'RESOLUTION_FLAGS="--resolution 1920x1080"\n',
         )
 
+    def test_audio_modes_map_to_expected_drivers(self):
+        drivers = {mode: driver for mode, (_, driver) in player.AUDIO_MODES.items()}
+        self.assertEqual(drivers, {"both": "pulseaudio", "tv": "pulseaudio", "pc": "dummy"})
+
     def test_creates_missing_parent_directory(self):
-        player.write_session(make_cfg(), "Desktop", "both", "1920x1080", self.path)
+        player.write_session("Desktop", "both", "1920x1080", self.path)
         self.assertTrue(self.path.is_file())
 
-    def test_default_sunshine_app_is_allowed_even_when_not_in_apps(self):
-        cfg = make_cfg(APPS="Other", SUNSHINE_APP="Desktop")
-        player.write_session(cfg, "Desktop", "both", "1920x1080", self.path)
-        self.assertEqual(player.read_session(self.path)["app"], "Desktop")
+    def test_app_is_not_checked_against_the_configured_list(self):
+        player.write_session("Anything Else", "both", "1920x1080", self.path)
+        self.assertEqual(player.read_session(self.path)["app"], "Anything Else")
 
-    def assert_rejected(self, cfg, app="Desktop", audio="both", resolution="1920x1080", message=""):
+    def test_default_path_is_the_session_path(self):
+        target = self.dir / "default.env"
+        with mock.patch.object(player, "session_path", return_value=target):
+            player.write_session("Desktop", "pc", "1920x1080")
+        self.assertEqual(player.read_session(target), {"app": "Desktop", "audio": "pc"})
+
+    def assert_rejected(self, app="Desktop", audio="both", resolution="1920x1080", message=""):
         with self.assertRaisesRegex(ValueError, message):
-            player.write_session(cfg, app, audio, resolution, self.path)
+            player.write_session(app, audio, resolution, self.path)
         self.assertFalse(self.path.exists())
 
     def test_rejects_unknown_audio_mode(self):
-        self.assert_rejected(make_cfg(), audio="surround", message="audio mode")
-
-    def test_rejects_unknown_app(self):
-        self.assert_rejected(make_cfg(), app="Calculator", message="unknown app")
+        self.assert_rejected(audio="surround", message="audio mode")
 
     def test_rejects_bad_resolutions(self):
-        for resolution in ("", "1920", "1920x", "x1080", "19x10", "123456x1080", "1920x1080 --evil"):
-            self.assert_rejected(make_cfg(), resolution=resolution, message="resolution")
+        for resolution in ("", "1920", "1920x", "x1080", "19x10", "123456x1080", "1920x1080 --evil", "1920x1080\n"):
+            self.assert_rejected(resolution=resolution, message="resolution")
 
-    def test_rejects_dangerous_app_names_even_when_configured(self):
+    def test_rejects_dangerous_app_names(self):
         for app in ('A"b', "A\\b", "A$b", "A\nb", "-flag"):
-            self.assert_rejected(make_cfg(APPS=f"Desktop,{app}"), app=app, message="invalid app name")
+            self.assert_rejected(app=app, message="invalid app name")
 
 
 class ReadSessionTests(SessionFileCase):
@@ -68,6 +72,11 @@ class ReadSessionTests(SessionFileCase):
         self.path.write_text('SUNSHINE_APP="X"\nAUDIO_FLAGS="--foo"\nAUDIO_DRIVER=pulseaudio\n')
         self.assertEqual(player.read_session(self.path), {"app": "X", "audio": ""})
 
+    def test_driver_distinguishes_modes_with_equal_flags(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('AUDIO_FLAGS="--audio-on-host"\nAUDIO_DRIVER=dummy\n')
+        self.assertEqual(player.read_session(self.path)["audio"], "pc")
+
     def test_default_path_uses_user_runtime_dir(self):
         with mock.patch.object(os, "getuid", create=True, return_value=1234):
             self.assertEqual(player.session_path(), Path("/run/user/1234/galaxy-session.env"))
@@ -75,11 +84,9 @@ class ReadSessionTests(SessionFileCase):
 
 class ControlTests(unittest.TestCase):
     def setUp(self):
-        run = mock.patch.object(player.subprocess, "run")
-        euid = mock.patch.object(os, "geteuid", create=True, return_value=1000)
-        self.run, self.euid = run.start(), euid.start()
-        self.addCleanup(run.stop)
-        self.addCleanup(euid.stop)
+        self.run = start_patch(self, player.subprocess, "run")
+        self.euid = start_patch(self, os, "geteuid", create=True, return_value=1000)
+        self.log = start_patch(self, player, "log")
         self.run.return_value = mock.Mock(returncode=0, stderr="")
 
     def test_non_root_uses_sudo(self):
@@ -96,14 +103,24 @@ class ControlTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Unit not found"):
             player.control("start", "u.service")
 
-    def test_start_failure_without_stderr_names_the_unit(self):
+    def test_start_failure_without_stderr_names_the_command(self):
         self.run.return_value = mock.Mock(returncode=1, stderr="")
-        with self.assertRaisesRegex(RuntimeError, "u.service failed to start"):
+        with self.assertRaisesRegex(RuntimeError, "systemctl start u.service failed"):
             player.control("start", "u.service")
 
-    def test_stop_failure_is_ignored(self):
-        self.run.return_value = mock.Mock(returncode=1, stderr="x")
+    def test_stop_failure_is_logged_not_raised(self):
+        self.run.return_value = mock.Mock(returncode=1, stderr="busy")
         player.control("stop", "u.service")
+        self.log.assert_called_once_with("busy")
+
+    def test_stop_failure_without_stderr_logs_default_message(self):
+        self.run.return_value = mock.Mock(returncode=1, stderr="")
+        player.control("stop", "u.service")
+        self.log.assert_called_once_with("systemctl stop u.service failed")
+
+    def test_success_logs_nothing(self):
+        player.control("stop", "u.service")
+        self.log.assert_not_called()
 
 
 class ActiveAndStopAllTests(unittest.TestCase):
@@ -112,6 +129,15 @@ class ActiveAndStopAllTests(unittest.TestCase):
             self.assertTrue(player.active("u"))
         with mock.patch.object(player.subprocess, "run", return_value=mock.Mock(returncode=3)):
             self.assertFalse(player.active("u"))
+
+    def test_any_active_is_true_when_either_unit_runs(self):
+        for running in (player.MOONLIGHT, player.OBS):
+            with mock.patch.object(player, "active", side_effect=lambda unit: unit == running):
+                self.assertTrue(player.any_active(), running)
+
+    def test_any_active_is_false_when_no_unit_runs(self):
+        with mock.patch.object(player, "active", return_value=False):
+            self.assertFalse(player.any_active())
 
     def test_stop_all_stops_only_active_units(self):
         with mock.patch.object(player, "active", side_effect=lambda unit: unit == player.OBS):
@@ -122,9 +148,7 @@ class ActiveAndStopAllTests(unittest.TestCase):
 
 class ConfirmTests(unittest.TestCase):
     def setUp(self):
-        sleep = mock.patch.object(player.time, "sleep")
-        self.sleep = sleep.start()
-        self.addCleanup(sleep.stop)
+        self.sleep = start_patch(self, player.time, "sleep")
 
     def test_raises_when_unit_exits(self):
         with mock.patch.object(player, "active", return_value=False):

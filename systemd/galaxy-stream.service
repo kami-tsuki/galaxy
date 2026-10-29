@@ -17,6 +17,7 @@ UtmpIdentifier=tty1
 UtmpMode=user
 EnvironmentFile=/etc/galaxy/galaxy.env
 EnvironmentFile=-/run/user/@UID@/galaxy-session.env
+UnsetEnvironment=SUNSHINE_USER SUNSHINE_PASS SUNSHINE_CERT_SHA256 OBS_PASS API_TOKEN
 Environment=XDG_RUNTIME_DIR=/run/user/@UID@
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
 ExecStart=/usr/bin/setpriv --inh-caps=-all /usr/bin/cage -s -- /usr/bin/flatpak run --env=SDL_AUDIODRIVER=${AUDIO_DRIVER} com.moonlight_stream.Moonlight stream ${PC_HOST} ${SUNSHINE_APP} $MOONLIGHT_ARGS $RESOLUTION_FLAGS $AUDIO_FLAGS

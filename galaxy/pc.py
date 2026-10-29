@@ -42,14 +42,16 @@ def wake(cfg):
                 sock.sendto(packet, (target, port))
 
 
-def boot(cfg, on_wait=lambda: None):
+def boot(cfg, on_wait=lambda: None, stop=lambda: False):
     if sunshine_up(cfg):
         return
     on_wait()
     deadline = time.time() + int(cfg["BOOT_WAIT"])
-    while time.time() < deadline and not sunshine_up(cfg):
+    while time.time() < deadline and not stop() and not sunshine_up(cfg):
         wake(cfg)
         time.sleep(5)
+    if stop():
+        return
     if not sunshine_up(cfg):
         raise RuntimeError("PC did not come up")
 

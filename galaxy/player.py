@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from . import config
+from .log import log
 
 MOONLIGHT = "galaxy-stream.service"
 OBS = "galaxy-obs.service"
@@ -14,22 +15,29 @@ AUDIO_MODES = {
     "tv": ("--no-audio-on-host", "pulseaudio"),
     "pc": ("--audio-on-host", "dummy"),
 }
-RESOLUTION = re.compile(r"^\d{3,5}x\d{3,5}$")
+RESOLUTION = re.compile(r"\d{3,5}x\d{3,5}")
 
 
 def session_path():
-    return Path(f"/run/user/{os.getuid()}/galaxy-session.env")
+    return config.runtime_dir() / "galaxy-session.env"
 
 
 def control(action, unit):
     prefix = [] if os.geteuid() == 0 else ["sudo", "-n"]
     result = subprocess.run(prefix + ["systemctl", action, unit], capture_output=True, text=True)
-    if result.returncode != 0 and action == "start":
-        raise RuntimeError(result.stderr.strip() or f"{unit} failed to start")
+    if result.returncode != 0:
+        message = result.stderr.strip() or f"systemctl {action} {unit} failed"
+        if action == "start":
+            raise RuntimeError(message)
+        log(message)
 
 
 def active(unit):
     return subprocess.run(["systemctl", "is-active", "--quiet", unit]).returncode == 0
+
+
+def any_active():
+    return any(active(unit) for unit in UNITS)
 
 
 def stop_all():
@@ -46,11 +54,9 @@ def confirm(unit, seconds=10):
         time.sleep(1)
 
 
-def write_session(cfg, app, audio, resolution, path=None):
+def write_session(app, audio, resolution, path=None):
     if audio not in AUDIO_MODES:
         raise ValueError(f"unknown audio mode '{audio}', choose from: {', '.join(AUDIO_MODES)}")
-    if app not in config.apps(cfg) and app != cfg["SUNSHINE_APP"]:
-        raise ValueError(f"unknown app '{app}', choose from: {', '.join(config.apps(cfg))}")
     if not RESOLUTION.fullmatch(resolution):
         raise ValueError(f"invalid resolution '{resolution}'")
     if any(char in app for char in '"\\$\n') or app.startswith("-"):

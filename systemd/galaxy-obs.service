@@ -16,6 +16,7 @@ TTYVHangup=yes
 UtmpIdentifier=tty1
 UtmpMode=user
 EnvironmentFile=/etc/galaxy/galaxy.env
+UnsetEnvironment=SUNSHINE_USER SUNSHINE_PASS SUNSHINE_CERT_SHA256 OBS_PASS API_TOKEN
 Environment=XDG_RUNTIME_DIR=/run/user/@UID@
 ExecStart=/usr/bin/setpriv --inh-caps=-all /usr/bin/cage -s -- /usr/bin/mpv --fs --no-terminal --osd-level=0 --force-window=yes --profile=low-latency srt://0.0.0.0:${SRT_PORT}?mode=listener
 ExecStopPost=+/usr/bin/systemctl --no-block start getty@tty1.service

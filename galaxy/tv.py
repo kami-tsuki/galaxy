@@ -2,6 +2,10 @@ import subprocess
 import time
 
 from .config import flag
+from .log import log
+
+ATTEMPTS = 3
+SETTLE_SECONDS = 6
 
 
 def cec(cfg, command):
@@ -13,7 +17,8 @@ def cec(cfg, command):
             timeout=25,
         )
         return result.stdout.decode(errors="replace")
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
+        log(f"cec-client failed: {error}")
         return ""
 
 
@@ -36,9 +41,11 @@ def switch(cfg, on):
     if not flag(cfg, "TV_CEC"):
         return True
     wanted = "on" if on else "standby"
-    for _ in range(3):
+    for attempt in range(ATTEMPTS):
         if power_state(cfg) == wanted:
             return True
         cec(cfg, "on 0" if on else "standby 0")
-        time.sleep(6)
+        if attempt < ATTEMPTS - 1:
+            time.sleep(SETTLE_SECONDS)
+    time.sleep(SETTLE_SECONDS)
     return power_state(cfg) == wanted

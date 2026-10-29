@@ -56,8 +56,8 @@ details { background: var(--card); border: 1px solid var(--line); border-radius:
 summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
 .tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .tools button, .tools input { font: inherit; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
-.tools input { flex: 1 1 200px; }
-button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.tools label { flex: 1 1 200px; display: grid; gap: 4px; font-size: 0.8rem; color: var(--muted); }
+button:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 </style>
 </head>
 <body>
@@ -67,19 +67,19 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     <div class="pill"><span class="dot" id="dot"></span><span id="state">connecting</span></div>
   </header>
 
-  <section>
-    <h2>What to share</h2>
-    <div class="choices" id="sources"></div>
+  <section aria-labelledby="sources-title">
+    <h2 id="sources-title">What to share</h2>
+    <div class="choices" id="sources" role="group" aria-labelledby="sources-title"></div>
   </section>
 
-  <section id="app-section">
-    <h2>What to show</h2>
-    <div class="choices" id="apps"></div>
+  <section id="app-section" aria-labelledby="apps-title">
+    <h2 id="apps-title">What to show</h2>
+    <div class="choices" id="apps" role="group" aria-labelledby="apps-title"></div>
   </section>
 
-  <section id="audio-section">
-    <h2>Sound</h2>
-    <div class="choices" id="audio"></div>
+  <section id="audio-section" aria-labelledby="audio-title">
+    <h2 id="audio-title">Sound</h2>
+    <div class="choices" id="audio" role="group" aria-labelledby="audio-title"></div>
   </section>
 
   <p class="hint" id="obs-hint" hidden>OBS sends its picture and sound straight to the TV. Nothing opens on your monitors.</p>
@@ -94,15 +94,15 @@ button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
       <button type="button" data-post="tv/on">TV on</button>
       <button type="button" data-post="tv/off">TV off</button>
       <button type="button" data-post="sleep">Sleep PC</button>
-      <input id="token" type="password" placeholder="API token" autocomplete="off">
+      <label>API token<input id="token" type="password" autocomplete="off"></label>
     </div>
   </details>
 </main>
 
 <script>
 const LABELS = {
-  main: ["Main screen", "Wide monitor, shown with bars on the TV"],
-  second: ["Second screen", "Full HD monitor, fills the TV"],
+  main: ["Main screen", "Your main display"],
+  second: ["Second screen", "Your second display"],
   obs: ["OBS output", "OBS goes straight to the TV"],
   both: ["PC + TV", "Sound on both"],
   pc: ["PC only", "TV stays quiet"],
@@ -110,8 +110,11 @@ const LABELS = {
 };
 const PHASES = {
   idle: "Ready", tv: "Turning the TV on", waking: "Waking the PC", display: "Switching screen",
-  connecting: "Connecting", streaming: "Connected", stopping: "Disconnecting", error: "Problem"
+  connecting: "Connecting", streaming: "Connected", stopping: "Disconnecting",
+  reconnecting: "Reconnecting", error: "Problem"
 };
+const POLL_MS = 2000;
+const NOTICE_MS = 8000;
 
 const $ = (id) => document.getElementById(id);
 const store = {
@@ -125,13 +128,16 @@ if (hash.get("token")) {
   history.replaceState(null, "", location.pathname);
 }
 $("token").value = store.get("token", "");
-$("token").addEventListener("change", () => { store.set("token", $("token").value); poll(); });
+$("token").addEventListener("input", () => store.set("token", $("token").value));
+$("token").addEventListener("change", () => poll());
 
 const choice = { source: store.get("source", ""), app: store.get("app", ""), audio: store.get("audio", "both") };
+const rendered = {};
 let current = null;
 let pending = false;
 let dirty = false;
-let notice = "";
+let polling = false;
+let notice = { text: "", at: 0 };
 
 function headers() { return { Authorization: "Bearer " + $("token").value, "Content-Type": "application/json" }; }
 
@@ -143,13 +149,21 @@ async function api(path, method, body) {
   return data;
 }
 
+function setNotice(text) { notice = { text, at: Date.now() }; }
+
 function render(group, items, key, locked) {
+  const signature = JSON.stringify([items, choice[key], locked]);
+  if (rendered[group] === signature) return;
+  rendered[group] = signature;
   const box = $(group);
+  const hadFocus = box.contains(document.activeElement);
+  const focused = hadFocus ? document.activeElement.dataset.item : null;
   box.replaceChildren();
   for (const item of items) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "choice";
+    button.dataset.item = item;
     button.setAttribute("aria-pressed", String(choice[key] === item));
     button.disabled = locked;
     const [title, hint] = LABELS[item] || [item, ""];
@@ -160,6 +174,7 @@ function render(group, items, key, locked) {
     button.append(strong, span);
     button.addEventListener("click", () => { choice[key] = item; store.set(key, item); dirty = true; draw(); });
     box.append(button);
+    if (focused === item && !locked) button.focus();
   }
 }
 
@@ -180,18 +195,22 @@ function draw() {
   const phase = current.phase;
   $("state").textContent = PHASES[phase] || phase;
   $("dot").className = "dot " + (phase === "error" ? "err" : streaming ? "on" : locked ? "busy" : "");
-  $("go").textContent = locked ? PHASES[phase] || "Working" : streaming ? (dirty ? "Apply changes" : "Disconnect") : "Connect";
-  $("go").className = "go" + (streaming && !locked && !dirty ? " stop" : "");
-  $("go").disabled = locked;
+  const cancelling = current.busy || phase === "reconnecting";
+  $("go").textContent = cancelling ? "Cancel" : streaming ? (dirty ? "Apply changes" : "Disconnect") : "Connect";
+  $("go").className = "go" + ((streaming && !dirty) || cancelling ? " stop" : "");
+  $("go").disabled = pending;
+  const problem = notice.text || current.error;
   const message = $("msg");
-  const problem = notice || current.error;
   message.className = "msg" + (problem ? " err" : "");
   message.textContent = problem || current.warning || (!current.pc_online && !streaming && phase === "idle" ? "PC is off or asleep, Connect will wake it" : "");
 }
 
 async function poll() {
+  if (polling) return;
+  polling = true;
   try {
     current = await api("status");
+    if (notice.text && Date.now() - notice.at > NOTICE_MS) notice = { text: "", at: 0 };
     if (current.stream && !dirty && !pending) {
       if (current.sources.includes(current.source)) choice.source = current.source;
       if (current.apps.includes(current.app)) choice.app = current.app;
@@ -205,34 +224,40 @@ async function poll() {
     $("msg").className = "msg err";
     $("msg").textContent = error.message;
     $("go").disabled = true;
+  } finally {
+    polling = false;
   }
 }
 
-$("go").addEventListener("click", async () => {
+async function act(request) {
   pending = true;
-  notice = "";
+  notice = { text: "", at: 0 };
   draw();
   try {
-    if (current.stream && !dirty) await api("stop", "POST");
-    else await api("connect", "POST", { source: choice.source, app: choice.app, audio: choice.audio });
+    await request();
     dirty = false;
   } catch (error) {
-    notice = error.message;
+    setNotice(error.message);
   }
-  await new Promise((resolve) => setTimeout(resolve, 700));
   pending = false;
-  poll();
-});
+  while (polling) await new Promise((resolve) => setTimeout(resolve, 50));
+  await poll();
+}
 
-document.querySelectorAll("[data-post]").forEach((button) => button.addEventListener("click", async () => {
-  if (button.dataset.post === "sleep" && !confirm("Put the PC to sleep?")) return;
-  notice = "";
-  try { await api(button.dataset.post, "POST"); } catch (error) { notice = error.message; }
-  poll();
+$("go").addEventListener("click", () => act(() => {
+  if (current.busy || current.phase === "reconnecting" || (current.stream && !dirty)) return api("stop", "POST");
+  return api("connect", "POST", { source: choice.source, app: choice.app, audio: choice.audio });
 }));
 
-poll();
-setInterval(poll, 2000);
+document.querySelectorAll("[data-post]").forEach((button) => button.addEventListener("click", () => {
+  if (button.dataset.post === "sleep" && !confirm("Put the PC to sleep?")) return;
+  act(() => api(button.dataset.post, "POST"));
+}));
+
+(async function loop() {
+  await poll();
+  setTimeout(loop, POLL_MS);
+})();
 </script>
 </body>
 </html>

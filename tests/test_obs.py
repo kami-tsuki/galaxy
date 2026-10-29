@@ -125,11 +125,115 @@ class ClientTests(unittest.TestCase):
                     client.call("GetStreamStatus")
 
 
+def raw_frame(opcode, payload, fin=True):
+    first = (0x80 if fin else 0) | opcode
+    if len(payload) < 126:
+        return bytes([first, len(payload)]) + payload
+    return bytes([first, 126]) + len(payload).to_bytes(2, "big") + payload
+
+
+def ws_with(data):
+    ws = obs.Ws.__new__(obs.Ws)
+    ws.buf = data
+    ws.sock = mock.Mock()
+    ws.sock.recv.return_value = b""
+    return ws
+
+
+class WsRecvTests(unittest.TestCase):
+    def test_single_frame_message(self):
+        self.assertEqual(ws_with(raw_frame(1, b'{"op": 2}')).recv(), {"op": 2})
+
+    def test_fragmented_message_is_reassembled_across_continuation_frames(self):
+        data = raw_frame(1, b'{"op": ', fin=False) + raw_frame(0, b'"x', fin=False) + raw_frame(0, b'y"}')
+        self.assertEqual(ws_with(data).recv(), {"op": "xy"})
+
+    def test_ping_between_fragments_is_answered_and_message_still_completes(self):
+        data = raw_frame(1, b'{"a":', fin=False) + raw_frame(9, b"hb") + raw_frame(0, b" 1}")
+        ws = ws_with(data)
+        with mock.patch.object(ws, "send_frame") as send:
+            self.assertEqual(ws.recv(), {"a": 1})
+        send.assert_called_once_with(10, b"hb")
+
+    def test_message_is_not_returned_before_the_final_fragment(self):
+        ws = ws_with(raw_frame(1, b'{"a": 1}', fin=False))
+        with self.assertRaisesRegex(RuntimeError, "closed the connection"):
+            ws.recv()
+
+    def test_consecutive_messages_are_read_one_at_a_time(self):
+        ws = ws_with(raw_frame(1, b'{"n": 1}') + raw_frame(1, b'{"n": 2}'))
+        self.assertEqual([ws.recv(), ws.recv()], [{"n": 1}, {"n": 2}])
+
+    def test_oversized_frame_is_rejected_before_reading_payload(self):
+        header = bytes([0x81, 127]) + (obs.MAX_FRAME + 1).to_bytes(8, "big")
+        with self.assertRaisesRegex(RuntimeError, "oversized"):
+            ws_with(header).recv()
+
+    def test_frame_at_the_limit_is_not_rejected_as_oversized(self):
+        header = bytes([0x81, 127]) + obs.MAX_FRAME.to_bytes(8, "big")
+        with self.assertRaisesRegex(RuntimeError, "closed the connection"):
+            ws_with(header).recv()
+
+    def test_close_frame_reports_known_reason(self):
+        data = raw_frame(8, (4009).to_bytes(2, "big") + b"no")
+        with self.assertRaisesRegex(RuntimeError, "authentication failed"):
+            ws_with(data).recv()
+
+    def test_close_frame_with_unknown_code_reports_the_code(self):
+        with self.assertRaisesRegex(RuntimeError, "code 1006"):
+            ws_with(raw_frame(8, (1006).to_bytes(2, "big"))).recv()
+
+    def test_close_frame_without_payload_reports_code_zero(self):
+        with self.assertRaisesRegex(RuntimeError, "code 0"):
+            ws_with(raw_frame(8, b"")).recv()
+
+
+class ConstantsTests(unittest.TestCase):
+    def test_canvas_and_audio_bitrate(self):
+        self.assertEqual(obs.CANVAS, (1920, 1080))
+        self.assertEqual(obs.AUDIO_BITRATE, "160")
+
+    def test_previous_profile_file_lives_in_the_runtime_dir(self):
+        with mock.patch.object(obs.config, "runtime_dir", return_value=Path("/run/user/7")):
+            self.assertEqual(obs.previous_profile_file(), Path("/run/user/7/galaxy-obs-previous"))
+
+
+class ObsTimeoutTests(unittest.TestCase):
+    def test_timeout_names_the_dialog_cause(self):
+        client = obs.Client.__new__(obs.Client)
+        client.ws = mock.Mock()
+        client.ws.recv.side_effect = TimeoutError()
+        with self.assertRaises(RuntimeError) as caught:
+            client.call("GetVersion")
+        self.assertIn("dialog", str(caught.exception))
+
+
+class HandshakeSocketTests(unittest.TestCase):
+    def test_rejected_handshake_closes_the_socket(self):
+        sock = mock.Mock()
+        sock.recv.return_value = b"HTTP/1.1 403 Forbidden\r\n\r\n"
+        with mock.patch.object(obs.socket, "create_connection", return_value=sock):
+            with self.assertRaisesRegex(RuntimeError, "handshake failed"):
+                obs.Ws("127.0.0.1", 4455)
+        sock.close.assert_called_once()
+
+    def test_connection_closed_during_handshake_closes_the_socket(self):
+        sock = mock.Mock()
+        sock.recv.return_value = b""
+        with mock.patch.object(obs.socket, "create_connection", return_value=sock):
+            with self.assertRaises(RuntimeError):
+                obs.Ws("127.0.0.1", 4455)
+        sock.close.assert_called_once()
+
+
 class FakeObs:
-    def __init__(self, current="Other", profiles=("Other",), streaming=False):
+    def __init__(self, current="Other", profiles=("Other",), streaming=False, camera=False):
         self.current = current
         self.profiles = list(profiles)
         self.streaming = streaming
+        self.camera = camera
+        self.video = {"baseWidth": 640, "baseHeight": 480, "outputWidth": 640, "outputHeight": 480, "fpsNumerator": 30}
+        self.video_error = None
         self.calls = []
         self.error = None
 
@@ -150,6 +254,18 @@ class FakeObs:
             return {"outputActive": self.streaming}
         if kind == "GetProfileList":
             return {"currentProfileName": self.current, "profiles": self.profiles}
+        if kind == "GetVideoSettings":
+            return dict(self.video)
+        if kind == "GetVirtualCamStatus":
+            return {"outputActive": self.camera}
+        if kind == "StopVirtualCam":
+            self.camera = False
+        if kind == "StartVirtualCam":
+            self.camera = True
+        if kind == "SetVideoSettings":
+            if self.video_error:
+                raise self.video_error
+            self.video = dict(data)
         if kind == "StartStream":
             self.streaming = True
         if kind == "StopStream":
@@ -195,6 +311,8 @@ class BeginTests(ObsFlowCase):
                 "GetStreamStatus",
                 "GetProfileList",
                 "CreateProfile",
+                "GetVideoSettings",
+                "GetVirtualCamStatus",
                 "SetVideoSettings",
                 "SetProfileParameter",
                 "SetProfileParameter",
@@ -342,3 +460,40 @@ class EndTests(ObsFlowCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CanvasTests(ObsFlowCase):
+    def begin(self, **overrides):
+        obs.begin(make_cfg(OBS_FPS="60", **overrides), self.URL)
+
+    def test_matching_canvas_is_left_alone(self):
+        self.fake.video = {
+            "baseWidth": 1920, "baseHeight": 1080, "outputWidth": 1920, "outputHeight": 1080,
+            "fpsNumerator": 60, "fpsDenominator": 1,
+        }
+        self.begin()
+        self.assertNotIn("SetVideoSettings", self.fake.kinds())
+        self.assertNotIn("GetVirtualCamStatus", self.fake.kinds())
+
+    def test_running_virtual_camera_is_paused_and_restored(self):
+        self.fake.camera = True
+        self.begin()
+        kinds = self.fake.kinds()
+        self.assertLess(kinds.index("StopVirtualCam"), kinds.index("SetVideoSettings"))
+        self.assertLess(kinds.index("SetVideoSettings"), kinds.index("StartVirtualCam"))
+        self.assertTrue(self.fake.camera)
+
+    def test_stopped_virtual_camera_stays_stopped(self):
+        self.begin()
+        self.assertNotIn("StartVirtualCam", self.fake.kinds())
+        self.assertFalse(self.fake.camera)
+
+    def test_rejected_change_explains_what_to_stop_and_restores_camera(self):
+        self.fake.camera = True
+        self.fake.video_error = RuntimeError("Video settings cannot be changed while an output is active.")
+        with self.assertRaises(RuntimeError) as caught:
+            self.begin()
+        self.assertIn("stop any recording or stream in OBS", str(caught.exception))
+        self.assertTrue(self.fake.camera)
+        self.assertNotIn("StartStream", self.fake.kinds())
+

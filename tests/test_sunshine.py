@@ -1,62 +1,154 @@
-import io
+import hashlib
 import itertools
 import json
 import unittest
-import urllib.error
 from unittest import mock
 
 from galaxy import sunshine
-from tests.helpers import JobsCase, make_cfg
+from tests.helpers import JobsCase, make_cfg, start_patch
+
+CERT = b"certificate-bytes"
+CERT_SHA = hashlib.sha256(CERT).hexdigest()
 
 
-def response(body):
-    handle = mock.MagicMock()
-    handle.__enter__.return_value.read.return_value = body
-    return handle
+class ConnectionCase(unittest.TestCase):
+    def setUp(self):
+        factory = start_patch(self, sunshine.http.client, "HTTPSConnection")
+        self.factory = factory
+        self.connection = factory.return_value
+        self.connection.sock.getpeercert.return_value = CERT
+        self.reply(200, b"{}")
+
+    def reply(self, status, body):
+        answer = mock.Mock(status=status)
+        answer.read.return_value = body
+        self.connection.getresponse.return_value = answer
 
 
-class ApiTests(unittest.TestCase):
-    def call(self, raw=b"{}", **kwargs):
-        with mock.patch.object(sunshine.urllib.request, "urlopen", return_value=response(raw)) as urlopen:
-            result = sunshine.api(make_cfg(SUNSHINE_UI_PORT="4999"), *kwargs.pop("args", ("GET", "/api/config")), **kwargs)
-        return result, urlopen.call_args.args[0]
+class ApiTests(ConnectionCase):
+    def call(self, *args, **kwargs):
+        cfg = make_cfg(SUNSHINE_UI_PORT="4999", **kwargs.pop("cfg", {}))
+        return sunshine.api(cfg, *(args or ("GET", "/api/config")), **kwargs)
 
-    def test_requires_username(self):
-        with mock.patch.object(sunshine.urllib.request, "urlopen") as urlopen:
-            with self.assertRaisesRegex(RuntimeError, "SUNSHINE_USER"):
-                sunshine.api(make_cfg(SUNSHINE_USER=""), "GET", "/api/config")
-        urlopen.assert_not_called()
+    def test_requires_username_before_connecting(self):
+        with self.assertRaisesRegex(RuntimeError, "SUNSHINE_USER"):
+            sunshine.api(make_cfg(SUNSHINE_USER=""), "GET", "/api/config")
+        self.factory.assert_not_called()
 
-    def test_builds_https_request_with_basic_auth(self):
-        _, request = self.call()
-        self.assertEqual(request.full_url, "https://192.0.2.10:4999/api/config")
-        self.assertEqual(request.get_method(), "GET")
-        self.assertEqual(request.get_header("Authorization"), "Basic dXNlcjpwYXNz")
-        self.assertIsNone(request.data)
+    def test_connects_to_the_ui_port_over_https_with_timeout(self):
+        self.call()
+        args, kwargs = self.factory.call_args
+        self.assertEqual(args, ("192.0.2.10", 4999))
+        self.assertEqual(kwargs["timeout"], 15)
+        self.assertIsNotNone(kwargs["context"])
+
+    def test_sends_basic_auth_and_no_body_for_get(self):
+        self.call()
+        method, path = self.connection.request.call_args.args
+        kwargs = self.connection.request.call_args.kwargs
+        self.assertEqual((method, path), ("GET", "/api/config"))
+        self.assertIsNone(kwargs["body"])
+        self.assertEqual(kwargs["headers"]["Authorization"], "Basic dXNlcjpwYXNz")
 
     def test_posts_json_body(self):
-        _, request = self.call(args=("POST", "/api/config"), body={"a": 1})
-        self.assertEqual(request.get_method(), "POST")
-        self.assertEqual(json.loads(request.data), {"a": 1})
+        self.call("POST", "/api/config", body={"a": 1})
+        self.assertEqual(self.connection.request.call_args.args[0], "POST")
+        self.assertEqual(json.loads(self.connection.request.call_args.kwargs["body"]), {"a": 1})
+        self.assertEqual(self.connection.request.call_args.kwargs["headers"]["Content-Type"], "application/json")
 
     def test_parses_json_response(self):
-        result, _ = self.call(b'{"x": 2}')
-        self.assertEqual(result, {"x": 2})
+        self.reply(200, b'{"x": 2}')
+        self.assertEqual(self.call(), {"x": 2})
 
     def test_empty_response_is_empty_dict(self):
-        result, _ = self.call(b"")
-        self.assertEqual(result, {})
+        self.reply(200, b"")
+        self.assertEqual(self.call(), {})
 
-    def test_http_error_becomes_runtime_error_with_status(self):
-        error = urllib.error.HTTPError("https://x", 401, "Unauthorized", {}, io.BytesIO())
-        with mock.patch.object(sunshine.urllib.request, "urlopen", side_effect=error):
-            with self.assertRaisesRegex(RuntimeError, "401"):
-                sunshine.api(make_cfg(), "GET", "/api/config")
+    def test_connection_is_closed_on_success_and_on_error(self):
+        self.call()
+        self.connection.close.assert_called_once()
+        self.connection.close.reset_mock()
+        self.connection.request.side_effect = OSError("reset")
+        with self.assertRaises(OSError):
+            self.call()
+        self.connection.close.assert_called_once()
+
+    def test_rejected_login_statuses_name_the_credentials(self):
+        for status in (401, 403):
+            self.reply(status, b"")
+            with self.assertRaisesRegex(RuntimeError, "rejected the login"):
+                self.call()
+
+    def test_other_error_statuses_report_code_and_path(self):
+        for status in (400, 404, 500):
+            self.reply(status, b"")
+            with self.assertRaisesRegex(RuntimeError, f"answered {status} for /api/config"):
+                self.call()
 
     def test_connection_errors_stay_oserror(self):
-        with mock.patch.object(sunshine.urllib.request, "urlopen", side_effect=ConnectionRefusedError):
+        self.connection.connect.side_effect = ConnectionRefusedError
+        with self.assertRaises(OSError):
+            self.call()
+        self.connection.close.assert_called_once()
+
+    def test_invalid_json_response_is_a_value_error_within_errors(self):
+        self.reply(200, b"<html>")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertIn(ValueError, sunshine.ERRORS)
+        self.assertIn(OSError, sunshine.ERRORS)
+        self.assertIn(RuntimeError, sunshine.ERRORS)
+
+
+class PinningTests(ConnectionCase):
+    def call(self, pinned):
+        return sunshine.api(make_cfg(SUNSHINE_CERT_SHA256=pinned), "GET", "/api/config")
+
+    def test_matching_pin_allows_the_request(self):
+        self.call(CERT_SHA)
+        self.connection.request.assert_called_once()
+
+    def test_pin_comparison_ignores_case_and_surrounding_whitespace(self):
+        self.call(f"  {CERT_SHA.upper()} ")
+        self.connection.request.assert_called_once()
+
+    def test_mismatching_pin_aborts_before_sending_credentials(self):
+        with self.assertRaisesRegex(RuntimeError, "python3 -m galaxy pin"):
+            self.call("0" * 64)
+        self.connection.request.assert_not_called()
+        self.connection.close.assert_called_once()
+
+    def test_empty_pin_skips_the_certificate_check(self):
+        self.connection.sock.getpeercert.side_effect = AssertionError("must not read the certificate")
+        self.call("")
+        self.connection.request.assert_called_once()
+
+
+class FingerprintTests(unittest.TestCase):
+    def test_returns_sha256_of_the_peer_certificate(self):
+        tls = mock.MagicMock()
+        tls.__enter__.return_value.getpeercert.return_value = CERT
+        context = mock.Mock()
+        context.wrap_socket.return_value = tls
+        sock = mock.MagicMock()
+        with mock.patch.object(sunshine.socket, "create_connection", return_value=sock) as connect:
+            with mock.patch.object(sunshine, "tls_context", return_value=context):
+                result = sunshine.fingerprint(make_cfg(SUNSHINE_UI_PORT="4999"))
+        self.assertEqual(result, CERT_SHA)
+        self.assertEqual(connect.call_args.args[0], ("192.0.2.10", 4999))
+        self.assertEqual(context.wrap_socket.call_args.kwargs["server_hostname"], "192.0.2.10")
+
+    def test_connection_failure_propagates(self):
+        with mock.patch.object(sunshine.socket, "create_connection", side_effect=OSError("down")):
             with self.assertRaises(OSError):
-                sunshine.api(make_cfg(), "GET", "/api/config")
+                sunshine.fingerprint(make_cfg())
+
+
+class TlsContextTests(unittest.TestCase):
+    def test_does_not_verify_the_chain_since_sunshine_is_self_signed(self):
+        context = sunshine.tls_context()
+        self.assertFalse(context.check_hostname)
+        self.assertEqual(context.verify_mode, sunshine.ssl.CERT_NONE)
 
 
 class SettingsTests(unittest.TestCase):

@@ -34,10 +34,14 @@ class CecTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][-1], "/dev/cec9")
         self.assertEqual(run.call_args.kwargs["input"], b"pow 0")
 
-    def test_failures_yield_empty_output(self):
-        for error in (FileNotFoundError(), subprocess.TimeoutExpired("cec-client", 25)):
+    def test_failures_yield_empty_output_and_are_logged(self):
+        for error in (FileNotFoundError("no cec-client"), subprocess.TimeoutExpired("cec-client", 25)):
             with mock.patch.object(tv.subprocess, "run", side_effect=error):
-                self.assertEqual(tv.cec(make_cfg(), "pow 0"), "")
+                with mock.patch.object(tv, "log") as log:
+                    self.assertEqual(tv.cec(make_cfg(), "pow 0"), "")
+            log.assert_called_once()
+            self.assertIn("cec-client failed", log.call_args.args[0])
+
 
 
 class SwitchTests(unittest.TestCase):
@@ -81,15 +85,30 @@ class SwitchTests(unittest.TestCase):
         self.assertTrue(tv.switch(make_cfg(), False))
         self.cec.assert_called_once_with(mock.ANY, "standby 0")
 
-    def test_retries_three_times_then_reports_failure(self):
-        self.states("standby", "standby", "standby", "standby")
+    def test_retries_attempts_times_then_reports_failure(self):
+        self.states(*["standby"] * (tv.ATTEMPTS + 1))
         self.assertFalse(tv.switch(make_cfg(), True))
-        self.assertEqual(self.cec.call_count, 3)
+        self.assertEqual(self.cec.call_count, tv.ATTEMPTS)
+
+    def test_sleeps_between_attempts_and_once_before_the_final_check_only(self):
+        self.states(*["standby"] * (tv.ATTEMPTS + 1))
+        tv.switch(make_cfg(), True)
+        self.assertEqual(self.sleep.call_args_list, [mock.call(tv.SETTLE_SECONDS)] * tv.ATTEMPTS)
+
+    def test_no_sleep_after_the_last_failed_attempt_besides_the_settle(self):
+        self.states(*["standby"] * (tv.ATTEMPTS + 1))
+        order = mock.Mock()
+        order.attach_mock(self.cec, "cec")
+        order.attach_mock(self.sleep, "sleep")
+        tv.switch(make_cfg(), True)
+        names = [call[0] for call in order.mock_calls]
+        self.assertEqual(names[-2:], ["cec", "sleep"])
+        self.assertEqual(names.count("sleep"), tv.ATTEMPTS)
 
     def test_final_check_can_still_succeed_after_last_attempt(self):
-        self.states("unknown", "unknown", "unknown", "on")
+        self.states(*["unknown"] * tv.ATTEMPTS, "on")
         self.assertTrue(tv.switch(make_cfg(), True))
-        self.assertEqual(self.cec.call_count, 3)
+        self.assertEqual(self.cec.call_count, tv.ATTEMPTS)
 
 
 if __name__ == "__main__":
