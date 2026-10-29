@@ -1,0 +1,21 @@
+[Unit]
+Description=Galaxy Moonlight stream
+After=network-online.target systemd-user-sessions.service getty@tty1.service
+Wants=network-online.target
+Conflicts=getty@tty1.service
+
+[Service]
+User=@USER@
+PAMName=login
+TTYPath=/dev/tty1
+StandardInput=tty
+TTYReset=yes
+TTYVHangup=yes
+UtmpIdentifier=tty1
+UtmpMode=user
+EnvironmentFile=/etc/galaxy/galaxy.env
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+ExecStart=/usr/bin/setpriv --inh-caps=-all /usr/bin/cage -s -- /usr/bin/flatpak run --env=SDL_AUDIODRIVER=alsa --env=AUDIODEV=${AUDIO_DEVICE} com.moonlight_stream.Moonlight stream ${PC_HOST} ${SUNSHINE_APP} $MOONLIGHT_ARGS
+ExecStopPost=+/usr/bin/systemctl --no-block start getty@tty1.service
+Restart=no
