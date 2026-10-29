@@ -1,0 +1,19 @@
+[Unit]
+Description=Galaxy control API
+After=network-online.target user@@UID@.service
+Wants=network-online.target user@@UID@.service
+
+[Service]
+User=@USER@
+WorkingDirectory=@DIR@
+ExecStart=/usr/bin/python3 -m galaxy serve
+Restart=always
+RestartSec=3
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
