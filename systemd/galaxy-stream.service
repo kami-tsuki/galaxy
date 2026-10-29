@@ -2,7 +2,7 @@
 Description=Galaxy Moonlight stream
 After=network-online.target systemd-user-sessions.service getty@tty1.service
 Wants=network-online.target
-Conflicts=getty@tty1.service
+Conflicts=getty@tty1.service galaxy-obs.service
 
 [Service]
 User=@USER@
@@ -20,3 +20,4 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
 ExecStart=/usr/bin/setpriv --inh-caps=-all /usr/bin/cage -s -- /usr/bin/flatpak run --env=SDL_AUDIODRIVER=${AUDIO_DRIVER} --env=AUDIODEV=${AUDIO_DEVICE} com.moonlight_stream.Moonlight stream ${PC_HOST} ${SUNSHINE_APP} $MOONLIGHT_ARGS $RESOLUTION_FLAGS $AUDIO_FLAGS
 ExecStopPost=+/usr/bin/systemctl --no-block start getty@tty1.service
 Restart=no
+TimeoutStopSec=5

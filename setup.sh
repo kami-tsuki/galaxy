@@ -8,9 +8,10 @@ if [ "$TARGET_USER" = "root" ]; then
     exit 1
 fi
 TARGET_UID="$(id -u "$TARGET_USER")"
+UNITS="galaxy.service galaxy-stream.service galaxy-obs.service"
 
 sudo apt-get update
-sudo apt-get install -y cage flatpak cec-utils python3 openssh-client util-linux
+sudo apt-get install -y cage flatpak mpv cec-utils python3 openssh-client util-linux
 
 sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 sudo flatpak install -y --noninteractive flathub com.moonlight_stream.Moonlight
@@ -29,13 +30,18 @@ else
     done < <(grep -E '^[A-Z_]+=' "$DIR/.env.example")
 fi
 
-for unit in galaxy.service galaxy-stream.service; do
-    sed -e "s|@USER@|$TARGET_USER|g" -e "s|@UID@|$TARGET_UID|g" -e "s|@DIR@|$DIR|g" "$DIR/$unit" \
+for unit in $UNITS; do
+    sed -e "s|@USER@|$TARGET_USER|g" -e "s|@UID@|$TARGET_UID|g" -e "s|@DIR@|$DIR|g" "$DIR/systemd/$unit" \
         | sudo tee "/etc/systemd/system/$unit" >/dev/null
 done
 
-echo "$TARGET_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start galaxy-stream.service, /usr/bin/systemctl stop galaxy-stream.service" \
-    | sudo tee /etc/sudoers.d/galaxy >/dev/null
+rules=""
+for unit in galaxy-stream.service galaxy-obs.service; do
+    for action in start stop; do
+        rules="$rules${rules:+, }/usr/bin/systemctl $action $unit"
+    done
+done
+echo "$TARGET_USER ALL=(root) NOPASSWD: $rules" | sudo tee /etc/sudoers.d/galaxy >/dev/null
 sudo chmod 0440 /etc/sudoers.d/galaxy
 sudo visudo -cf /etc/sudoers.d/galaxy
 
@@ -44,8 +50,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable galaxy.service
 sudo systemctl restart galaxy.service
 
-echo "Next:"
+echo "Next, from $DIR:"
 echo "  sudo nano /etc/galaxy/galaxy.env"
-echo "  python3 $DIR/galaxy.py set SUNSHINE_USER"
-echo "  python3 $DIR/galaxy.py set SUNSHINE_PASS"
-echo "  python3 $DIR/galaxy.py pair"
+echo "  python3 -m galaxy set SUNSHINE_USER"
+echo "  python3 -m galaxy set SUNSHINE_PASS"
+echo "  python3 -m galaxy pair"
