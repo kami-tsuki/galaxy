@@ -49,7 +49,10 @@ sudo visudo -cf /etc/sudoers.d/galaxy
 sudo loginctl enable-linger "$TARGET_USER"
 until [ -d "/run/user/$TARGET_UID" ]; do sleep 1; done
 user_ctl() { sudo -u "$TARGET_USER" XDG_RUNTIME_DIR="/run/user/$TARGET_UID" systemctl --user "$@"; }
-user_ctl enable --now pipewire.socket pipewire-pulse.socket wireplumber.service
+sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/.config/pipewire"
+sudo -u "$TARGET_USER" cp -r "$DIR/pipewire/." "$TARGET_HOME/.config/pipewire/"
+user_ctl enable pipewire.socket pipewire-pulse.socket wireplumber.service
+user_ctl restart pipewire.service pipewire-pulse.service wireplumber.service
 user_ctl mask xdg-desktop-portal.service xdg-desktop-portal-gtk.service
 sudo systemctl daemon-reload
 sudo systemctl enable galaxy.service

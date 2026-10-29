@@ -146,6 +146,7 @@ Plain HTTP with `Authorization: Bearer <API_TOKEN>`; keep it on the home network
 
 ## Notes
 
+- PipeWire is configured with a 1024-sample minimum buffer (`pipewire/`). Moonlight asks for a tiny buffer by default, and the Pi's HDMI output then underruns thousands of times, which sounds like one sound every few seconds.
 - The desktop portal services are masked for the user: Moonlight waits for them on every start, which delayed it by more than a minute on a Pi without a desktop.
 - The player units clear the inheritable capability set with `setpriv`, because the login session grants one and Flatpak's sandbox refuses to start with it.
 - After a stop the login prompt returns on tty1; with `TV_OFF_ON_STOP=true` the TV is off anyway.
